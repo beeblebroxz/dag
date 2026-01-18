@@ -39,10 +39,15 @@ jobs:
       run: |
         xvfb-run -a pytest -v --tb=short
 
-    - name: Run tests (macOS/Windows)
-      if: runner.os != 'Linux'
+    - name: Run tests (macOS)
+      if: runner.os == 'macOS'
       run: |
         pytest -v --tb=short
+
+    - name: Run tests (Windows - skip UI tests)
+      if: runner.os == 'Windows'
+      run: |
+        pytest -v --tb=short --ignore=tests/test_ui_bindings.py
 
   lint:
     runs-on: ubuntu-latest

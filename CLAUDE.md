@@ -122,7 +122,6 @@ Given computed functions where `C = self.A() + self.B()`, `A = self.B() + 1`, an
 @dag.computed(dag.Serialized)   # The result will be serialized
 @dag.computed(dag.Persisted)    # == dag.Input | dag.Serialized
 @dag.computed(dag.Optional)     # Return None instead of raising exceptions
-@dag.computed(dag.Remote)       # Hint for remote/parallel computation
 ```
 
 ### Parser and Dependency Detection
@@ -243,13 +242,6 @@ with dag.branch() as b2:
   ```
 - **Computed functions cache based on arguments** - each unique value creates a node
 - **Use lambdas as return values** to avoid creating excessive parameterized nodes
-
-### Remote Computations
-
-Since computed functions are pure functions, it's trivial to detect what nodes can execute in parallel:
-- Flag computed functions as `dag.Remote` for automatic remote scheduling
-- Or call `dag.doRemote()` within the computed function to explicitly schedule remotely
-- Remote scheduling has latency - chunk of work should be substantial (order of seconds)
 
 ---
 

@@ -75,7 +75,6 @@ from .flags import (
     CanChange,
     Input,
     Overridable,
-    Remote,
     Flags,
     Serialized,
     Persisted,
@@ -107,7 +106,6 @@ __all__ = [
     "Overridable",
     "Persisted",
     "Optional",
-    "Remote",
     "CanChange",
     "NO_VALUE",
     # State management

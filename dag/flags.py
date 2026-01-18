@@ -21,7 +21,6 @@ class Flags:
     Input: Final[int] = 1 << 1         # Can be set permanently
     Overridable: Final[int] = 1 << 2   # Can be temporarily overridden
     Optional: Final[int] = 1 << 3      # Return NO_VALUE instead of raising
-    Remote: Final[int] = 1 << 4        # Hint for remote computation
 
     # Compound flags
     Persisted: Final[int] = Input | Serialized  # Input + Serialized
@@ -55,5 +54,4 @@ Input = Flags.Input
 Overridable = Flags.Overridable
 Persisted = Flags.Persisted
 Optional = Flags.Optional
-Remote = Flags.Remote
 CanChange = Flags.CanChange

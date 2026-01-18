@@ -37,9 +37,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/abhishekgulati/dag"
-Repository = "https://github.com/abhishekgulati/dag"
-Issues = "https://github.com/abhishekgulati/dag/issues"
+Homepage = "https://github.com/beeblebroxz/dag"
+Repository = "https://github.com/beeblebroxz/dag"
+Issues = "https://github.com/beeblebroxz/dag/issues"
 
 [project.optional-dependencies]
 dev = [

@@ -19,7 +19,7 @@ pip install dag
 Or install from source:
 
 ```bash
-git clone https://github.com/abhishekgulati/dag.git
+git clone https://github.com/beeblebroxz/dag.git
 cd dag
 pip install -e .
 ```

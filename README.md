@@ -31,31 +31,31 @@ import dag
 
 class PriceCalculator(dag.Model):
     @dag.computed(dag.Input)
-    def quantity(self):
+    def Quantity(self):
         return 100
 
     @dag.computed(dag.Input)
-    def unit_price(self):
+    def UnitPrice(self):
         return 9.99
 
     @dag.computed
-    def total(self):
-        return self.quantity() * self.unit_price()
+    def Total(self):
+        return self.Quantity() * self.UnitPrice()
 
     @dag.computed
-    def total_with_tax(self):
-        return self.total() * 1.08
+    def TotalWithTax(self):
+        return self.Total() * 1.08
 
 # Create calculator
 calc = PriceCalculator()
 
-print(calc.total())          # 999.0
-print(calc.total_with_tax()) # 1078.92
+print(calc.Total())          # 999.0
+print(calc.TotalWithTax()) # 1078.92
 
 # Change a value - dependents automatically recompute
-calc.quantity.set(200)
-print(calc.total())          # 1998.0
-print(calc.total_with_tax()) # 2157.84
+calc.Quantity.set(200)
+print(calc.Total())          # 1998.0
+print(calc.TotalWithTax()) # 2157.84
 ```
 
 ## Core Concepts
@@ -81,20 +81,20 @@ When computed functions call other computed functions, dependencies are automati
 ```python
 class Option(dag.Model):
     @dag.computed(dag.Input)
-    def spot(self):
+    def Spot(self):
         return 100.0
 
     @dag.computed(dag.Input)
-    def strike(self):
+    def Strike(self):
         return 100.0
 
     @dag.computed
-    def intrinsic(self):
-        # Automatically depends on spot() and strike()
-        return max(0, self.spot() - self.strike())
+    def Intrinsic(self):
+        # Automatically depends on Spot() and Strike()
+        return max(0, self.Spot() - self.Strike())
 ```
 
-When `spot` or `strike` changes, `intrinsic` is automatically invalidated and will recompute on next access.
+When `Spot` or `Strike` changes, `Intrinsic` is automatically invalidated and will recompute on next access.
 
 ### Scenarios and Overrides
 
@@ -102,13 +102,13 @@ Use scenarios for temporary "what-if" calculations:
 
 ```python
 opt = Option()
-print(opt.intrinsic())  # 0.0
+print(opt.Intrinsic())  # 0.0
 
 with dag.scenario():
-    opt.spot.override(120.0)
-    print(opt.intrinsic())  # 20.0 (temporary)
+    opt.Spot.override(120.0)
+    print(opt.Intrinsic())  # 20.0 (temporary)
 
-print(opt.intrinsic())  # 0.0 (reverted)
+print(opt.Intrinsic())  # 0.0 (reverted)
 ```
 
 ### Watches
@@ -119,9 +119,9 @@ Watch computed functions to be notified when they change:
 def on_change(node):
     print(f"{node.method_name} changed!")
 
-calc.total.watch(on_change)
-calc.quantity.set(50)
-dag.flush()  # Triggers: "total changed!"
+calc.Total.watch(on_change)
+calc.Quantity.set(50)
+dag.flush()  # Triggers: "Total changed!"
 ```
 
 ## UI Bindings
@@ -135,10 +135,10 @@ app = DagApp("Calculator")
 calc = PriceCalculator()
 
 # Two-way binding: entry <-> computed function
-entry = BoundEntry(app.root, cell=calc.quantity, app=app)
+entry = BoundEntry(app.root, cell=calc.Quantity, app=app)
 
 # One-way binding: computed function -> label (auto-updates)
-label = BoundLabel(app.root, cell=calc.total, app=app)
+label = BoundLabel(app.root, cell=calc.Total, app=app)
 
 app.run()
 ```
@@ -177,12 +177,12 @@ Computed functions can take parameters:
 ```python
 class Portfolio(dag.Model):
     @dag.computed(dag.Input)
-    def price(self, ticker):
+    def Price(self, ticker):
         return {"AAPL": 150, "GOOGL": 140}.get(ticker, 0)
 
     @dag.computed
-    def total_value(self):
-        return self.price("AAPL") + self.price("GOOGL")
+    def TotalValue(self):
+        return self.Price("AAPL") + self.Price("GOOGL")
 ```
 
 ### Registry Pattern
@@ -192,15 +192,15 @@ Create indexed collections of objects:
 ```python
 class Instrument(dag.Model):
     @dag.computed(dag.Input)
-    def price(self):
+    def Price(self):
         return 0.0
 
 class InstrumentRegistry(dag.Registry[str, Instrument]):
     pass
 
 registry = InstrumentRegistry()
-registry["AAPL"].price.set(150.0)
-registry["GOOGL"].price.set(140.0)
+registry["AAPL"].Price.set(150.0)
+registry["GOOGL"].Price.set(140.0)
 ```
 
 ### Branches
@@ -212,11 +212,11 @@ base_branch = dag.branch()
 stressed_branch = dag.branch()
 
 with stressed_branch:
-    model.volatility.override(0.5)
-    stressed_price = model.price()
+    model.Volatility.override(0.5)
+    stressed_price = model.Price()
 
 with base_branch:
-    base_price = model.price()
+    base_price = model.Price()
 ```
 
 ### Untracked Mode
@@ -224,7 +224,7 @@ with base_branch:
 Skip dependency tracking in parts of the graph:
 
 ```python
-result = dag.untracked(lambda: model.compute())
+result = dag.untracked(lambda: model.Compute())
 # Dependencies from this call are not tracked
 ```
 

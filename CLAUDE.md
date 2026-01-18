@@ -54,6 +54,10 @@ pytest tests/test_basic.py
 - Docstrings follow Google style
 - Tests use pytest with fixtures
 - Each module has a clear single responsibility
+- **Computed functions use PascalCase** (e.g., `Spot`, `Strike`, `Price`, `TimeToExpiry`)
+  - This distinguishes them from regular Python methods which use `snake_case`
+  - Similar to how spreadsheet cells or financial model nodes are named
+  - Examples: `def Spot(self)`, `def RiskFreeRate(self)`, `def Delta(self)`
 
 ---
 

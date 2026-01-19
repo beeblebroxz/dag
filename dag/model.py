@@ -83,6 +83,10 @@ class Model(metaclass=ModelMeta):
     # Registry of computed functions (populated by metaclass)
     _computed_functions_: Dict[str, ComputedFunctionDescriptor]
 
+    # Store-awareness attributes (set by Store when object is stored/loaded)
+    _store_ref: Optional[weakref.ref] = None  # Weak reference to Store
+    _store_path: Optional[str] = None  # Path in the store
+
     def __init__(self):
         """
         Initialize the Model.
@@ -90,7 +94,9 @@ class Model(metaclass=ModelMeta):
         Subclasses should generally not override this.
         If you need initialization, use Input computed functions with defaults.
         """
-        pass
+        # Initialize instance-level store attributes
+        self._store_ref = None
+        self._store_path = None
 
     def __init_subclass__(cls, **kwargs):
         """Called when a subclass is created."""
@@ -109,6 +115,62 @@ class Model(metaclass=ModelMeta):
     def _get_computed_methods(self) -> Dict[str, ComputedFunctionDescriptor]:
         """Get all computed function descriptors for this instance."""
         return self._computed_functions_
+
+    # Store-awareness methods
+
+    def path(self) -> Optional[str]:
+        """Get this object's path in its store.
+
+        Returns:
+            The path if this object is stored, None otherwise.
+
+        Example:
+            option = db['/Instruments/AAPL_C_150']
+            print(option.path())  # '/Instruments/AAPL_C_150'
+        """
+        return self._store_path
+
+    def save(self) -> None:
+        """Save this object to its store.
+
+        The object must have been retrieved from or stored in a Store
+        so we know its path and store.
+
+        Raises:
+            RuntimeError: If object is not associated with a store.
+
+        Example:
+            option = db['/Instruments/AAPL_C_150']
+            option.Strike.set(160.0)
+            option.save()  # Persists the change
+        """
+        if self._store_ref is None or self._store_path is None:
+            raise RuntimeError(
+                "Object is not associated with a store. "
+                "Use db[path] = obj to store it first."
+            )
+        store = self._store_ref()
+        if store is None:
+            raise RuntimeError("Store has been garbage collected.")
+        store.save(self)
+
+    @property
+    def store(self) -> Any:
+        """Access the store this object belongs to.
+
+        Returns:
+            The Store instance, or raises RuntimeError if not stored.
+
+        Example:
+            option = db['/Instruments/AAPL_C_150']
+            other = option.store['/Instruments/GOOGL_C_100']
+        """
+        if self._store_ref is None:
+            raise RuntimeError("Object is not associated with a store.")
+        store = self._store_ref()
+        if store is None:
+            raise RuntimeError("Store has been garbage collected.")
+        return store
 
 
 class RegistryMixin:

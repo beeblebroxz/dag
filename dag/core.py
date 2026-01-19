@@ -440,7 +440,9 @@ class Scenario:
         old_value = node._tweak_value
         self._tweaks.append((node, old_value))
         node._tweak_value = new_value
-        self._dag.invalidate_node(node)
+        # Must invalidate dependents even if this node is already invalid
+        # (e.g., when node has a set_value but state is INVALID)
+        self._dag.invalidate_dependents(node)
 
     @property
     def layer_id(self) -> int:

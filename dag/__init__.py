@@ -142,7 +142,7 @@ def reset() -> None:
     DagManager.reset()
 
 
-# Convenience function for browsing the DAG (like the spec's qzdev browser)
+# Convenience function for browsing the DAG
 def browse(computed_accessor: ComputedFunctionAccessor) -> None:
     """
     Browse a computed function's dependencies and value.

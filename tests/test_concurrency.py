@@ -2,7 +2,6 @@
 Tests for thread safety and concurrency.
 """
 
-import pytest
 import threading
 import time
 import dag
@@ -15,12 +14,7 @@ class TestThreadSafety:
         dag.reset()
 
     def test_concurrent_reads_after_cached(self):
-        """Test concurrent reads from multiple threads after value is cached.
-
-        Note: The DAG manager uses a shared eval_stack for cycle detection,
-        which can cause false positives when multiple threads evaluate the
-        same node simultaneously. Once the value is cached, concurrent reads work.
-        """
+        """Test concurrent reads from multiple threads after value is cached."""
         results = {}
         errors = []
 
@@ -53,6 +47,43 @@ class TestThreadSafety:
 
         assert len(errors) == 0
         assert all(v == 42 for v in results.values())
+
+    def test_concurrent_first_reads_share_evaluation(self):
+        """Test concurrent uncached reads of the same node."""
+        results = []
+        errors = []
+        start = threading.Barrier(5)
+        call_count = {'value': 0}
+        call_count_lock = threading.Lock()
+
+        class Simple(dag.Model):
+            @dag.computed
+            def Value(self):
+                time.sleep(0.01)
+                with call_count_lock:
+                    call_count['value'] += 1
+                return 42
+
+        obj = Simple()
+
+        def reader():
+            try:
+                start.wait()
+                results.append(obj.Value())
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=reader) for _ in range(5)]
+
+        for t in threads:
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        assert results == [42] * 5
+        assert call_count['value'] == 1
 
     def test_concurrent_different_objects(self):
         """Test concurrent access to different objects."""
@@ -168,6 +199,7 @@ class TestThreadSafety:
         """Test creating scenarios from multiple threads."""
         errors = []
         contexts_created = []
+        start = threading.Barrier(5)
 
         class Simple(dag.Model):
             @dag.computed(dag.Overridable)
@@ -180,6 +212,7 @@ class TestThreadSafety:
             try:
                 with dag.scenario():
                     obj.Value.override(thread_id)
+                    start.wait()
                     value = obj.Value()
                     contexts_created.append((thread_id, value))
                     time.sleep(0.01)
@@ -199,9 +232,9 @@ class TestThreadSafety:
         for t in threads:
             t.join()
 
-        # Note: Scenarios are shared globally in current implementation,
-        # so this test may reveal that behavior
-        # The important thing is no crashes
+        assert len(errors) == 0
+        assert sorted(contexts_created) == [(i, i) for i in range(5)]
+        assert obj.Value() == 1
 
 
 class TestConcurrentInvalidation:

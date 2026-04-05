@@ -307,11 +307,59 @@ class TestBranches:
 
         opt = Option()
 
-        with dag.branch() as l1:
+        with dag.branch():
             opt.Strike.override(1.4)
             assert opt.Strike() == 1.4
 
         # After branch exits
+        assert opt.Strike() == 1.0
+
+    def test_branch_reentry_preserves_overrides(self):
+        """Test a branch remembers overrides across re-entry."""
+
+        class Option(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Strike(self):
+                return 1.0
+
+        opt = Option()
+        stressed = dag.Branch()
+
+        with stressed:
+            opt.Strike.override(1.4)
+            assert opt.Strike() == 1.4
+
+        assert opt.Strike() == 1.0
+
+        with stressed:
+            assert opt.Strike() == 1.4
+
+        assert opt.Strike() == 1.0
+
+    def test_branches_are_isolated(self):
+        """Test sibling branches keep separate override state."""
+
+        class Option(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Strike(self):
+                return 1.0
+
+        opt = Option()
+        branch_a = dag.Branch()
+        branch_b = dag.Branch()
+
+        with branch_a:
+            opt.Strike.override(1.4)
+
+        with branch_b:
+            opt.Strike.override(1.5)
+
+        with branch_a:
+            assert opt.Strike() == 1.4
+
+        with branch_b:
+            assert opt.Strike() == 1.5
+
         assert opt.Strike() == 1.0
 
 

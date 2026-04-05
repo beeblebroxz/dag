@@ -2,7 +2,6 @@
 Tests for edge cases and boundary conditions.
 """
 
-import pytest
 import gc
 import dag
 
@@ -58,6 +57,26 @@ class TestWeakReferences:
 
         # Node's weak ref should be dead
         assert node.obj_ref() is None
+
+    def test_nodes_are_removed_after_gc(self):
+        """Test manager nodes are cleaned up after a model is garbage-collected."""
+        from dag.core import DagManager
+
+        class Simple(dag.Model):
+            @dag.computed
+            def Value(self):
+                return 1
+
+        obj = Simple()
+        assert obj.Value() == 1
+
+        manager = DagManager.get_instance()
+        assert len(manager._nodes) == 1
+
+        del obj
+        gc.collect()
+
+        assert len(manager._nodes) == 0
 
 
 class TestContextEdgeCases:
@@ -315,6 +334,26 @@ class TestReEvaluationScenarios:
 
         # Clear - should recompute
         obj.Value.clearValue()
+        assert obj.Value() == 42
+        assert compute_count['value'] == 2
+
+    def test_clear_value_alias_triggers_recompute(self):
+        """Test the clear_value alias."""
+        compute_count = {'value': 0}
+
+        class Clearable(dag.Model):
+            @dag.computed(dag.Input)
+            def Value(self):
+                compute_count['value'] += 1
+                return 42
+
+        obj = Clearable()
+        assert obj.Value() == 42
+
+        obj.Value = 100
+        assert obj.Value() == 100
+
+        obj.Value.clear_value()
         assert obj.Value() == 42
         assert compute_count['value'] == 2
 

@@ -139,3 +139,77 @@ class TestUntrackedMode:
             dag.untracked(lambda: obj.Outer())
         ))
         assert result == 15
+
+    def test_untracked_suppresses_undeclared_dependency_errors(self):
+        """Test untracked allows dynamic access patterns."""
+
+        class Dynamic(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 3
+
+            @dag.computed
+            def B(self):
+                return dag.untracked(lambda: getattr(self, 'A')())
+
+        obj = Dynamic()
+        assert obj.B() == 3
+
+    def test_untracked_dependency_is_not_tracked(self):
+        """Test dependencies inside untracked do not invalidate the caller."""
+        counts = {'B': 0}
+
+        class Dynamic(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+            @dag.computed
+            def B(self):
+                counts['B'] += 1
+                return dag.untracked(lambda: getattr(self, 'A')())
+
+        obj = Dynamic()
+
+        assert obj.B() == 1
+        assert counts['B'] == 1
+
+        obj.A = 2
+
+        # B remains cached because its dynamic dependency was intentionally untracked.
+        assert obj.B() == 1
+        assert counts['B'] == 1
+
+    def test_untracked_preserves_nested_dependency_tracking(self):
+        """Test untracked does not disable tracking inside the callee itself."""
+        counts = {'B': 0, 'Top': 0}
+
+        class Nested(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+            @dag.computed
+            def B(self):
+                counts['B'] += 1
+                return self.A() * 2
+
+            @dag.computed
+            def Top(self):
+                counts['Top'] += 1
+                return dag.untracked(lambda: self.B())
+
+        obj = Nested()
+
+        assert obj.Top() == 2
+        assert counts == {'B': 1, 'Top': 1}
+
+        obj.A = 3
+
+        # Top remains cached because it did not track B.
+        assert obj.Top() == 2
+        assert counts == {'B': 1, 'Top': 1}
+
+        # B still tracks A for its own memoization contract.
+        assert obj.B() == 6
+        assert counts == {'B': 2, 'Top': 1}

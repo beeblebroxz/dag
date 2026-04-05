@@ -173,6 +173,44 @@ class TestDependencyTracking:
         assert obj.C() == 115
         assert counts == {'A': 1, 'B': 2, 'C': 2}  # A not recomputed (set value)
 
+    def test_runtime_dependencies_are_rebuilt_on_recompute(self):
+        """Test stale runtime dependencies are removed after recomputation."""
+        counts = {'C': 0}
+
+        class Conditional(dag.Model):
+            @dag.computed(dag.Input)
+            def UseA(self):
+                return 1
+
+            @dag.computed(dag.Input)
+            def A(self):
+                return 10
+
+            @dag.computed(dag.Input)
+            def B(self):
+                return 20
+
+            @dag.computed
+            def C(self):
+                counts['C'] += 1
+                if self.UseA():
+                    return self.A()
+                return self.B()
+
+        obj = Conditional()
+
+        assert obj.C() == 10
+        assert counts['C'] == 1
+
+        obj.UseA = 0
+        assert obj.C() == 20
+        assert counts['C'] == 2
+
+        # A should no longer be a live dependency after the branch changes.
+        obj.A = 100
+        assert obj.C() == 20
+        assert counts['C'] == 2
+
 
 class TestStaticDependencies:
     """Test static vs runtime dependency detection."""
@@ -209,3 +247,20 @@ class TestStaticDependencies:
         assert 'PairObject' in names
         assert 'Spot' in names  # Detected from self.PairObject().Spot()
         assert 'Strike' in names
+
+    def test_undeclared_runtime_dependency_raises(self):
+        """Test runtime dependencies must be declared statically."""
+
+        class Dynamic(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+            @dag.computed
+            def B(self):
+                return getattr(self, 'A')()
+
+        obj = Dynamic()
+
+        with pytest.raises(dag.UntrackedError):
+            obj.B()

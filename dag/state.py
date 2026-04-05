@@ -19,11 +19,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Tuple
 
-from .core import Scenario, DagManager, Node, scenario as create_scenario
+from .core import Scenario, DagManager, scenario as create_scenario
 from .decorators import ComputedFunctionAccessor
-from .flags import NO_VALUE
 
 if TYPE_CHECKING:
     from .model import Model
@@ -90,24 +89,28 @@ class Branch:
         self._dag = DagManager.get_instance()
         self._branch_id = self._dag.next_layer_id()
         self._parent = parent
-        self._overrides: Dict[Tuple[int, str, Tuple], Any] = {}  # (obj_id, method, args) -> value
+        self._overrides: Dict[Tuple[int, str, Tuple[Any, ...]], Override] = {}
+        self._scenario: Optional[BranchScenario] = None
 
     def __enter__(self) -> Branch:
-        # Create a scenario for this branch
-        self._scenario = create_scenario()
+        # Create a scenario for this branch and replay persisted overrides.
+        self._scenario = BranchScenario(self)
         self._scenario.__enter__()
+        self._apply_persisted_overrides(self._scenario)
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
+        assert self._scenario is not None
         self._scenario.__exit__(exc_type, exc_val, exc_tb)
+        self._scenario = None
         return False
 
     def override(self, obj: Model, method_name: str, value: Any, args: Tuple = ()) -> None:
         """Add an override to this branch."""
-        key = (id(obj), method_name, args)
-        self._overrides[key] = value
+        override = Override(obj=obj, method_name=method_name, value=value, args=args)
+        self._overrides[(id(obj), method_name, args)] = override
 
-        # Also apply to current scenario if active
+        # Also apply to the active scenario for this branch if it is entered.
         accessor = getattr(obj, method_name)
         if isinstance(accessor, ComputedFunctionAccessor):
             node = self._dag.get_or_create_node(
@@ -117,8 +120,42 @@ class Branch:
                 flags=accessor._descriptor.flags,
                 args=args,
             )
-            if self._dag.current_context:
-                self._dag.current_context.add_tweak(node, value)
+            if self._dag.current_context is self._scenario:
+                assert self._scenario is not None
+                self._scenario.add_tweak(node, value)
+
+    def _remember_override(self, node, value: Any) -> None:
+        """Persist an override made while this branch is active."""
+        obj = node.obj_ref()
+        if obj is None:
+            return
+
+        self._overrides[(id(obj), node.method_name, node.key.args)] = Override(
+            obj=obj,
+            method_name=node.method_name,
+            value=value,
+            args=node.key.args,
+        )
+
+    def _iter_overrides(self) -> Generator[Override, None, None]:
+        """Yield overrides inherited from parent branches first."""
+        if self._parent is not None:
+            yield from self._parent._iter_overrides()
+        yield from self._overrides.values()
+
+    def _apply_persisted_overrides(self, ctx: Scenario) -> None:
+        """Replay the branch's persisted overrides into the active scenario."""
+        for override in self._iter_overrides():
+            accessor = getattr(override.obj, override.method_name)
+            if isinstance(accessor, ComputedFunctionAccessor):
+                node = self._dag.get_or_create_node(
+                    obj=override.obj,
+                    method_name=override.method_name,
+                    func=accessor._descriptor.func,
+                    flags=accessor._descriptor.flags,
+                    args=override.args,
+                )
+                ctx.add_tweak(node, override.value)
 
     @property
     def branch_id(self) -> int:
@@ -147,6 +184,18 @@ def branch() -> Generator[Branch, None, None]:
         yield b
 
 
+class BranchScenario(Scenario):
+    """Scenario implementation that persists overrides onto a branch."""
+
+    def __init__(self, branch: Branch):
+        super().__init__()
+        self._branch = branch
+
+    def add_tweak(self, node, new_value: Any) -> None:
+        self._branch._remember_override(node, new_value)
+        super().add_tweak(node, new_value)
+
+
 def get_overrides() -> OverrideSet:
     """
     Get the current overrides as an OverrideSet.
@@ -167,7 +216,7 @@ def get_overrides() -> OverrideSet:
             override_set.add(
                 obj=obj,
                 method_name=node.method_name,
-                value=node._tweak_value,
+                value=dag.get_tweak_value(node.key),
                 args=node.key.args,
             )
 
@@ -186,27 +235,6 @@ def apply_overrides(override_set: OverrideSet) -> Scenario:
     override_set.apply(ctx)
     return ctx
 
-
-@dataclass
-class NodeChange:
-    """
-    Represents a change to apply to a node.
-
-    Used by inverse handlers to express mutual dependencies.
-
-    Example:
-        def spotChange(self, newSpot):
-            return [NodeChange(self.FwdCurve, shift(self.FwdCurve(), newSpot - self.Spot()))]
-    """
-    node_getter: Callable[[], ComputedFunctionAccessor]
-    value: Any
-
-    def apply(self) -> None:
-        """Apply this change."""
-        accessor = self.node_getter()
-        accessor.set(self.value)
-
-
 def untracked(func: Callable[[], Any]) -> Any:
     """
     Execute a function without strict dependency checking.
@@ -220,6 +248,9 @@ def untracked(func: Callable[[], Any]) -> Any:
     Usage:
         result = dag.untracked(lambda: self.SomeMethod())
     """
-    # For now, just execute the function
-    # Full implementation would temporarily disable dependency checking
-    return func()
+    dag = DagManager.get_instance()
+    caller_key = dag.enter_untracked()
+    try:
+        return func()
+    finally:
+        dag.exit_untracked(caller_key)

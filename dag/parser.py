@@ -11,6 +11,12 @@ The parser looks for patterns like:
 
 Per the spec, the parser greedily assumes that function invocations
 return cell objects, which is a safe overapproximation.
+
+Pyodide Compatibility:
+    In Pyodide (Python in WebAssembly), dynamically executed code doesn't
+    have source attached to it (inspect.getsource() fails). To work around
+    this, the parser checks a global source registry (dag._source_registry)
+    that can store code strings before execution.
 """
 
 from __future__ import annotations
@@ -126,6 +132,26 @@ class DependencyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _get_source_from_registry(func: Callable) -> Optional[str]:
+    """
+    Try to get source code from the Pyodide source registry.
+
+    In Pyodide, dynamically executed code doesn't have source attached.
+    Applications can store source code in dag._source_registry before exec().
+    """
+    try:
+        import dag
+        if hasattr(dag, '_source_registry'):
+            func_name = func.__name__
+            for source in dag._source_registry.values():
+                # Check if this source contains our function definition
+                if f'def {func_name}' in source:
+                    return source
+    except ImportError:
+        pass
+    return None
+
+
 def parse_dependencies(func: Callable) -> FrozenSet[str]:
     """
     Parse a cell function to extract its dependencies.
@@ -136,11 +162,16 @@ def parse_dependencies(func: Callable) -> FrozenSet[str]:
     Returns:
         A frozenset of dependency method names
     """
+    source = None
+
+    # Try standard inspect.getsource() first
     try:
         source = inspect.getsource(func)
     except (OSError, TypeError):
-        # Can't get source (e.g., built-in function)
-        return frozenset()
+        # Fallback for Pyodide: check source registry
+        source = _get_source_from_registry(func)
+        if source is None:
+            return frozenset()
 
     # Dedent the source in case it's a method defined inside a class
     source = textwrap.dedent(source)
@@ -183,10 +214,14 @@ def parse_dependencies_detailed(func: Callable) -> List[Dependency]:
     Returns:
         A list of Dependency objects with full details
     """
+    source = None
+
     try:
         source = inspect.getsource(func)
     except (OSError, TypeError):
-        return []
+        source = _get_source_from_registry(func)
+        if source is None:
+            return []
 
     source = textwrap.dedent(source)
 

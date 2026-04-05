@@ -2,6 +2,8 @@
 Custom exceptions for the DAG framework.
 """
 
+from typing import Optional
+
 
 class DagError(Exception):
     """Base exception for all DAG-related errors."""
@@ -40,7 +42,7 @@ class InvalidationError(DagError):
 class SetValueError(DagError):
     """Raised when trying to set a value on a computed function that doesn't support it."""
 
-    def __init__(self, func_name: str, message: str = None):
+    def __init__(self, func_name: str, message: Optional[str] = None):
         self.func_name = func_name
         msg = message or f"Computed function '{func_name}' does not have Input flag"
         super().__init__(msg)
@@ -49,7 +51,7 @@ class SetValueError(DagError):
 class OverrideError(DagError):
     """Raised when trying to override a value on a computed function that doesn't support it."""
 
-    def __init__(self, func_name: str, message: str = None):
+    def __init__(self, func_name: str, message: Optional[str] = None):
         self.func_name = func_name
         msg = message or f"Computed function '{func_name}' does not have Overridable flag"
         super().__init__(msg)

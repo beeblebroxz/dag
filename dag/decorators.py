@@ -37,11 +37,11 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
-    overload,
+    cast,
 )
 
 from .core import DagManager, Node
-from .exceptions import UntrackedError, SetValueError, OverrideError
+from .exceptions import SetValueError, OverrideError
 from .flags import NO_VALUE, Input, Overridable, Flags
 from .parser import parse_dependencies
 
@@ -76,7 +76,7 @@ class ComputedFunctionDescriptor:
         self.name = func.__name__
 
         # Copy function metadata
-        functools.update_wrapper(self, func)
+        functools.update_wrapper(cast(Any, self), func)
 
     def __get__(self, obj: Optional[Model], objtype=None) -> Union[ComputedFunctionDescriptor, ComputedFunctionAccessor]:
         if obj is None:
@@ -153,7 +153,6 @@ class ComputedFunctionAccessor:
             return
 
         # Direct set
-        old_value = node._set_value
         node._set_value = value
         # Invalidate dependents (not this node, since it now has a set value)
         self._dag.invalidate_dependents(node)
@@ -172,7 +171,7 @@ class ComputedFunctionAccessor:
         if ctx is None:
             raise OverrideError(
                 self._descriptor.name,
-                f"override must be called within a dag.scenario()"
+                "override must be called within a dag.scenario()"
             )
 
         node = self._get_or_create_node()
@@ -197,6 +196,10 @@ class ComputedFunctionAccessor:
         node = self._get_or_create_node()
         node._set_value = NO_VALUE
         self._dag.invalidate_node(node)
+
+    def clear_value(self) -> None:
+        """Pythonic alias for clearValue()."""
+        self.clearValue()
 
     def _get_or_create_node(self, args: Tuple = ()) -> Node:
         """Get or create the node for this computed function."""
@@ -236,25 +239,6 @@ class ComputedFunctionAccessor:
         return self._dag.get_node(key)
 
 
-
-# Type-preserving overloads for the decorator
-@overload
-def computed(func: F) -> F: ...
-
-@overload
-def computed(
-    flags: int = Flags.NONE,
-    *,
-    inverse: Optional[Callable] = None,
-) -> Callable[[F], F]: ...
-
-@overload
-def computed(
-    flags: int,
-    inverse: Optional[Callable] = None,
-) -> Callable[[F], F]: ...
-
-
 def computed(
     func_or_flags: Union[Callable, int, None] = None,
     inverse: Optional[Callable] = None,
@@ -274,7 +258,7 @@ def computed(
     """
     if func_or_flags is None:
         # @computed() with no arguments
-        def decorator(func: F) -> ComputedFunctionDescriptor:
+        def wrap_without_args(func: F) -> ComputedFunctionDescriptor:
             static_deps = parse_dependencies(func)
             return ComputedFunctionDescriptor(
                 func=func,
@@ -282,7 +266,7 @@ def computed(
                 inverse=inverse,
                 static_deps=static_deps,
             )
-        return decorator
+        return wrap_without_args
 
     if callable(func_or_flags):
         # @computed without parentheses
@@ -298,7 +282,7 @@ def computed(
     # @computed(flags) or @computed(flags, inverse=...)
     flags = func_or_flags
 
-    def decorator(func: F) -> ComputedFunctionDescriptor:
+    def wrap_with_flags(func: F) -> ComputedFunctionDescriptor:
         static_deps = parse_dependencies(func)
         return ComputedFunctionDescriptor(
             func=func,
@@ -307,7 +291,7 @@ def computed(
             static_deps=static_deps,
         )
 
-    return decorator
+    return wrap_with_flags
 
 
 class NodeChange:

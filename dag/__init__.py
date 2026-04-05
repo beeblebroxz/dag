@@ -187,3 +187,40 @@ def filter_nodes(
                 results.append(node)
 
     return results
+
+
+# Source registry for Pyodide compatibility
+# In Pyodide, dynamically executed code doesn't have source attached.
+# Applications can store source code here before exec() for the parser to find.
+_source_registry: dict = {}
+
+
+def get_model_nodes(model: Model) -> list:
+    """
+    Get all nodes associated with a model instance.
+
+    Useful for visualization and debugging.
+
+    Args:
+        model: The Model instance to inspect
+
+    Returns:
+        A list of dicts with node information:
+        - name: The method name
+        - state: The node state (valid/invalid/evaluating/error)
+        - value: String representation of the cached value
+        - inputs: List of method names this node depends on
+        - outputs: List of method names that depend on this node
+    """
+    nodes = []
+    mgr = DagManager.get_instance()
+    for key, node in mgr._nodes.items():
+        if key.obj_id == id(model):
+            nodes.append({
+                'name': node.method_name,
+                'state': node.state.name.lower(),
+                'value': repr(node._value) if node._value is not NO_VALUE else 'None',
+                'inputs': [k.method_name for k in node.inputs],
+                'outputs': [k.method_name for k in node.outputs],
+            })
+    return nodes

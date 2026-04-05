@@ -6,20 +6,26 @@ Event simulation is done by directly calling binding methods since
 event_generate() doesn't work reliably in headless testing.
 """
 
+import os
+
 import pytest
 import tkinter as tk
 import dag
 from dag.ui import (
     DagApp,
-    OutputBinding,
-    InputBinding,
-    TwoWayBinding,
     BoundLabel,
     BoundEntry,
     default_formatter,
     float_parser,
     int_parser,
     str_parser,
+)
+
+RUN_UI_TESTS = os.environ.get("DAG_RUN_UI_TESTS") == "1"
+
+pytestmark = pytest.mark.skipif(
+    not RUN_UI_TESTS,
+    reason="Set DAG_RUN_UI_TESTS=1 to run Tkinter UI tests.",
 )
 
 
@@ -101,7 +107,7 @@ class TestOutputBinding:
         model = Model()
         label = tk.Label(dag_app.root)
 
-        binding = dag_app.bind_output(model.Value, label)
+        dag_app.bind_output(model.Value, label)
 
         assert label.cget('text') == "42"
 
@@ -147,7 +153,7 @@ class TestOutputBinding:
         def currency_formatter(value):
             return f"${value:.2f}"
 
-        binding = dag_app.bind_output(model.Price, label, formatter=currency_formatter)
+        dag_app.bind_output(model.Price, label, formatter=currency_formatter)
 
         assert label.cget('text') == "$123.46"
 
@@ -162,7 +168,7 @@ class TestOutputBinding:
         model = Model()
         entry = tk.Entry(dag_app.root, state='readonly')
 
-        binding = dag_app.bind_output(model.Value, entry, formatter=str)
+        dag_app.bind_output(model.Value, entry, formatter=str)
 
         assert entry.get() == "test value"
 
@@ -229,7 +235,7 @@ class TestTwoWayBinding:
         model = Model()
         entry = tk.Entry(dag_app.root)
 
-        binding = dag_app.bind_twoway(model.Value, entry)
+        dag_app.bind_twoway(model.Value, entry)
 
         assert entry.get() == "3.14"
 
@@ -292,8 +298,6 @@ class TestTwoWayBinding:
         binding = dag_app.bind_twoway(model.Value, entry)
 
         # Initial evaluation
-        initial_count = update_count['cell']
-
         # Change widget
         entry.delete(0, tk.END)
         entry.insert(0, "10")

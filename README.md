@@ -13,7 +13,7 @@ A dependency tracking and memoization framework for Python, inspired by function
 ## Installation
 
 ```bash
-pip install dag
+pip install dag-framework
 ```
 
 Or install from source:
@@ -71,7 +71,7 @@ Computed functions are methods decorated with `@dag.computed`. They:
 @dag.computed              # Basic computed function - computed and cached
 @dag.computed(dag.Input)   # Can be permanently changed with set()
 @dag.computed(dag.Overridable) # Can be temporarily changed in a scenario
-@dag.computed(dag.Optional)  # Returns None instead of raising
+@dag.computed(dag.Optional)  # Returns dag.NO_VALUE instead of raising
 ```
 
 ### Dependency Graph
@@ -205,27 +205,27 @@ registry["GOOGL"].Price.set(140.0)
 
 ### Branches
 
-Branches provide independent graph states for parallel scenario analysis:
+Branches provide persistent override scopes for parallel scenario analysis:
 
 ```python
-base_branch = dag.branch()
-stressed_branch = dag.branch()
+stressed_branch = dag.Branch()
 
 with stressed_branch:
     model.Volatility.override(0.5)
     stressed_price = model.Price()
 
-with base_branch:
-    base_price = model.Price()
+with stressed_branch:
+    stressed_price_again = model.Price()  # same branch overrides still apply
 ```
 
 ### Untracked Mode
 
-Skip dependency tracking in parts of the graph:
+The DAG enforces that runtime dependencies must be declared statically. Use
+`dag.untracked(...)` for intentional dynamic access patterns that should not be
+tracked as dependencies of the caller.
 
 ```python
 result = dag.untracked(lambda: model.Compute())
-# Dependencies from this call are not tracked
 ```
 
 ## API Reference
@@ -234,7 +234,7 @@ result = dag.untracked(lambda: model.Compute())
 - `@dag.computed` - Mark a method as a computed function
 - `@dag.computed(dag.Input)` - Allow permanent value changes
 - `@dag.computed(dag.Overridable)` - Allow temporary overrides
-- `@dag.computed(dag.Optional)` - Return None on errors
+- `@dag.computed(dag.Optional)` - Return `dag.NO_VALUE` on errors
 
 ### Computed Function Methods
 - `func.set(value)` - Set a permanent value (requires Input)
@@ -257,6 +257,9 @@ result = dag.untracked(lambda: model.Compute())
 pip install -e ".[dev]"
 pytest
 ```
+
+Set `DAG_RUN_UI_TESTS=1` to enable the Tkinter UI tests in environments where
+Tk can open windows safely.
 
 ## License
 

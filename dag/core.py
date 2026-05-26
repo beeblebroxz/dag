@@ -197,6 +197,7 @@ class DagManager:
         self._layer_lock = threading.Lock()
         self._subscriptions: Dict[NodeKey, List[weakref.ref]] = {}
         self._subscriptions_lock = threading.RLock()
+        self._pending_notifications: Set[NodeKey] = set()
         self._scenario_owner: Optional[int] = None
         self._scenario_depth: int = 0
         self._scenario_lock = threading.Lock()
@@ -612,37 +613,44 @@ class DagManager:
             self._subscriptions[node_key].append(weakref.ref(callback))
 
     def _queue_subscription(self, node_key: NodeKey) -> None:
-        """Queue a subscription notification (lazy dispatch)."""
-        # For now, we don't dispatch immediately - use flush()
-        pass
+        """Enqueue a pending notification for a watched node (dispatched on flush)."""
+        with self._subscriptions_lock:
+            if node_key in self._subscriptions:
+                self._pending_notifications.add(node_key)
 
     def flush(self) -> None:
-        """Dispatch all queued subscription notifications."""
-        # Clean up dead references and invoke callbacks
+        """Dispatch pending notifications (one per watched node that changed
+        since the last flush) and clear the pending set."""
         with self._subscriptions_lock:
-            subscriptions = list(self._subscriptions.items())
+            pending = list(self._pending_notifications)
+            self._pending_notifications.clear()
 
-        for node_key, callbacks in subscriptions:
+        for node_key in pending:
             node = self.get_node(node_key)
-            if node is None or node.is_valid:
+            if node is None:
                 continue
+
+            with self._subscriptions_lock:
+                callbacks = list(self._subscriptions.get(node_key, []))
 
             live_callbacks = []
             for cb_ref in callbacks:
                 cb = cb_ref()
-                if cb is not None:
-                    live_callbacks.append(cb_ref)
-                    try:
-                        cb(node)
-                    except Exception:
-                        # Watch callbacks must not interrupt the DAG, but their
-                        # failures must be visible rather than silently dropped.
-                        logger.exception(
-                            "Watch callback for %r failed", node.method_name
-                        )
+                if cb is None:
+                    continue
+                live_callbacks.append(cb_ref)
+                try:
+                    cb(node)
+                except Exception:
+                    # Watch callbacks must not interrupt the DAG, but their
+                    # failures must be visible rather than silently dropped.
+                    logger.exception(
+                        "Watch callback for %r failed", node.method_name
+                    )
 
             with self._subscriptions_lock:
-                self._subscriptions[node_key] = live_callbacks
+                if node_key in self._subscriptions:
+                    self._subscriptions[node_key] = live_callbacks
 
 
 class Scenario:

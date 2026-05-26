@@ -156,6 +156,8 @@ class ComputedFunctionAccessor:
         node._set_value = value
         # Invalidate dependents (not this node, since it now has a set value)
         self._dag.invalidate_dependents(node)
+        # Notify watchers of this node itself (it changed).
+        self._dag._queue_subscription(node.key)
 
     def override(self, value: Any) -> None:
         """

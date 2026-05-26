@@ -268,3 +268,99 @@ class TestSubscriptions:
         assert any('Watch callback' in r.getMessage() for r in caplog.records)
         # A failing callback does not prevent others from running.
         assert 'good' in ran
+
+    def test_flush_notifies_once_per_change(self):
+        """A change enqueues one notification; flushing twice fires the callback
+        only once (the pending set is cleared on dispatch)."""
+
+        class Observable(dag.Model):
+            @dag.computed(dag.Input)
+            def Value(self):
+                return 1
+
+            @dag.computed
+            def Derived(self):
+                return self.Value() * 2
+
+        obj = Observable()
+        calls = []
+
+        def cb(node):
+            calls.append(1)
+
+        obj.Derived.watch(cb)
+        assert obj.Derived() == 2
+        obj.Value = 5  # invalidates Derived -> enqueued once
+        dag.flush()
+        dag.flush()  # pending is now empty
+
+        assert len(calls) == 1
+
+    def test_flush_fires_only_changed_watched_nodes(self):
+        """Only nodes that changed since the last flush are notified; an
+        unrelated, still-invalid watched node is not swept in."""
+
+        class M(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+            @dag.computed(dag.Input)
+            def B(self):
+                return 1
+
+            @dag.computed
+            def DA(self):
+                return self.A() + 1
+
+            @dag.computed
+            def DB(self):
+                return self.B() + 1
+
+        obj = M()
+        fired = []
+
+        def cb_da(node):
+            fired.append('DA')
+
+        def cb_db(node):
+            fired.append('DB')
+
+        obj.DA.watch(cb_da)
+        obj.DB.watch(cb_db)
+
+        assert obj.DA() == 2  # DA evaluated (valid); DB never evaluated (invalid)
+        obj.A = 9             # changes only DA's input
+        dag.flush()
+
+        assert fired == ['DA']  # DB (invalid but unchanged) must NOT fire
+
+    def test_watcher_rearms_after_reevaluation(self):
+        """After a notification the watcher fires again only once the node is
+        re-evaluated (re-armed) and then changed again."""
+
+        class Observable(dag.Model):
+            @dag.computed(dag.Input)
+            def Value(self):
+                return 1
+
+            @dag.computed
+            def Derived(self):
+                return self.Value() * 2
+
+        obj = Observable()
+        calls = []
+
+        def cb(node):
+            calls.append(1)
+
+        obj.Derived.watch(cb)
+        assert obj.Derived() == 2
+        obj.Value = 5
+        dag.flush()
+        assert len(calls) == 1
+
+        assert obj.Derived() == 10  # re-evaluate -> re-arm
+        obj.Value = 7
+        dag.flush()
+        assert len(calls) == 2

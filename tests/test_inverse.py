@@ -2,7 +2,6 @@
 Tests for inverse handlers.
 """
 
-import pytest
 import dag
 from dag.decorators import NodeChange
 
@@ -157,6 +156,40 @@ class TestDelegateChange:
         change.apply()
 
         assert obj.Value() == 42
+
+    def test_override_honors_inverse(self):
+        """override() on a cell with an inverse routes through the inverse like
+        set() does, but applies the resulting changes temporarily (reverting
+        when the scenario exits)."""
+
+        class Linked(dag.Model):
+            def _on_a_change(self, new_value):
+                return NodeChange(self.B, new_value * 2)
+
+            @dag.computed(dag.Overridable, inverse=lambda self, v: self._on_a_change(v))
+            def A(self):
+                return 1
+
+            @dag.computed(dag.Input)
+            def B(self):
+                return 2
+
+            @dag.computed
+            def Sum(self):
+                return self.A() + self.B()
+
+        obj = Linked()
+        assert obj.Sum() == 3  # 1 + 2
+
+        with dag.scenario():
+            obj.A.override(5)        # inverse redirects to B := 10, temporarily
+            assert obj.B() == 10
+            assert obj.A() == 1      # A itself is not tweaked (mirrors set semantics)
+            assert obj.Sum() == 11   # 1 + 10
+
+        # Everything reverts when the scenario exits.
+        assert obj.B() == 2
+        assert obj.Sum() == 3
 
 
 class TestNodeChangeClass:

@@ -2,7 +2,6 @@
 Tests for the watch/notification system.
 """
 
-import pytest
 import dag
 
 
@@ -231,3 +230,41 @@ class TestSubscriptions:
 
         # Should be notified
         assert 'called' in notifications
+
+    def test_callback_exception_is_logged_not_swallowed(self, caplog):
+        """A raising callback must not crash flush, but its error must be
+        surfaced (logged) rather than silently swallowed, and other callbacks
+        must still run."""
+        import logging
+
+        class Observable(dag.Model):
+            @dag.computed(dag.Input)
+            def Value(self):
+                return 1
+
+            @dag.computed
+            def Derived(self):
+                return self.Value() * 2
+
+        obj = Observable()
+        ran = []
+
+        def bad_callback(node):
+            raise RuntimeError("boom")
+
+        def good_callback(node):
+            ran.append('good')
+
+        obj.Derived.watch(bad_callback)
+        obj.Derived.watch(good_callback)
+
+        assert obj.Derived() == 2
+        obj.Value = 5  # invalidates Derived -> callbacks fire on flush
+
+        with caplog.at_level(logging.ERROR):
+            dag.flush()  # must not raise
+
+        # The bad callback's failure is surfaced, not silently swallowed.
+        assert any('Watch callback' in r.getMessage() for r in caplog.records)
+        # A failing callback does not prevent others from running.
+        assert 'good' in ran

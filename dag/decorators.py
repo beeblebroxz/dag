@@ -143,8 +143,6 @@ class ComputedFunctionAccessor:
         if not (self._descriptor.flags & Input):
             raise SetValueError(self._descriptor.name)
 
-        node = self._get_or_create_node()
-
         # Handle inverse if configured
         if self._descriptor.inverse is not None:
             changes = self._descriptor.inverse(self._obj, value)
@@ -153,6 +151,7 @@ class ComputedFunctionAccessor:
             return
 
         # Direct set
+        node = self._get_or_create_node()
         node._set_value = value
         # Invalidate dependents (not this node, since it now has a set value)
         self._dag.invalidate_dependents(node)
@@ -173,6 +172,14 @@ class ComputedFunctionAccessor:
                 self._descriptor.name,
                 "override must be called within a dag.scenario()"
             )
+
+        # Inverse handlers redirect the change to other nodes (mutual
+        # dependencies). Apply those as temporary tweaks so they revert with
+        # the scenario, mirroring how set() routes through the inverse.
+        if self._descriptor.inverse is not None:
+            changes = self._descriptor.inverse(self._obj, value)
+            self._apply_inverse_overrides(changes, ctx)
+            return
 
         node = self._get_or_create_node()
         ctx.add_tweak(node, value)
@@ -230,6 +237,20 @@ class ComputedFunctionAccessor:
                 node_accessor, value = change[0], change[1]
                 if callable(node_accessor):
                     node_accessor().set(value)
+
+    def _apply_inverse_overrides(self, changes: Any, ctx: Any) -> None:
+        """Apply NodeChange operations from an inverse handler as temporary
+        scenario tweaks (the override counterpart of _apply_inverse_changes)."""
+        if changes is None:
+            return
+
+        if not isinstance(changes, (list, tuple)):
+            changes = [changes]
+
+        for change in changes:
+            if isinstance(change, NodeChange):
+                node = change.node_accessor._get_or_create_node()
+                ctx.add_tweak(node, change.value)
 
     @property
     def _node(self) -> Optional[Node]:

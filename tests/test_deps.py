@@ -91,9 +91,10 @@ class TestASTParser:
 
         deps = parse_dependencies(sample_method)
         assert 'Items' in deps
-        # Note: 'Price' is called on 'item', not 'self', so it's not detected
-        # as a static dependency. This is a known limitation - the parser
-        # only tracks self.X() calls. Runtime tracking handles this.
+        # 'Price' is called on 'item', not 'self', so the parser cannot detect
+        # it statically (it only sees self.X() chains). Such cross-object calls
+        # are tracked at runtime and evaluate correctly -- see
+        # TestDependencyTracking.test_cross_object_iteration_evaluates.
 
     def test_self_method_in_loop(self):
         """Test self method calls inside loops."""
@@ -210,6 +211,95 @@ class TestDependencyTracking:
         obj.A = 100
         assert obj.C() == 20
         assert counts['C'] == 2
+
+    def test_cross_object_iteration_evaluates(self):
+        """A computed function may call computed functions on OTHER models
+        (e.g. summing over a collection). Such cross-object calls cannot be
+        resolved statically by the parser, so they must be tracked at runtime
+        without being rejected by the untracked check."""
+
+        class Instrument(dag.Model):
+            @dag.computed(dag.Input)
+            def Price(self):
+                return 0.0
+
+        class Portfolio(dag.Model):
+            @dag.computed(dag.Input)
+            def Instruments(self):
+                return []
+
+            @dag.computed
+            def TotalValue(self):
+                return sum(inst.Price() for inst in self.Instruments())
+
+        a, b = Instrument(), Instrument()
+        a.Price.set(10.0)
+        b.Price.set(20.0)
+
+        p = Portfolio()
+        p.Instruments.set([a, b])
+
+        assert p.TotalValue() == 30.0
+
+    def test_cross_object_dependency_invalidates(self):
+        """Changing a child model's input invalidates a parent that consumed it
+        via a cross-object call, proving the runtime edge was recorded."""
+
+        class Instrument(dag.Model):
+            @dag.computed(dag.Input)
+            def Price(self):
+                return 0.0
+
+        class Portfolio(dag.Model):
+            @dag.computed(dag.Input)
+            def Instruments(self):
+                return []
+
+            @dag.computed
+            def TotalValue(self):
+                return sum(inst.Price() for inst in self.Instruments())
+
+        a, b = Instrument(), Instrument()
+        a.Price.set(10.0)
+        b.Price.set(20.0)
+
+        p = Portfolio()
+        p.Instruments.set([a, b])
+        assert p.TotalValue() == 30.0
+
+        b.Price.set(50.0)
+        assert p.TotalValue() == 60.0
+
+    def test_deep_invalidation_does_not_overflow(self):
+        """Invalidation must propagate through very deep dependency chains
+        without exceeding Python's recursion limit."""
+
+        class Chain(dag.Model):
+            @dag.computed(dag.Input)
+            def Base(self):
+                return 0
+
+            @dag.computed
+            def Link(self, i):
+                if i == 0:
+                    return self.Base()
+                return self.Link(i - 1) + 1
+
+        obj = Chain()
+        depth = 2000  # exceeds the default recursion limit
+
+        # Build the chain bottom-up so evaluation itself stays shallow.
+        for i in range(depth + 1):
+            obj.Link(i)
+        assert obj.Link(depth) == depth
+
+        # Changing Base invalidates the entire chain; this must not overflow.
+        obj.Base = 1
+
+        # Re-evaluate bottom-up (keeps evaluation shallow) and confirm new value.
+        for i in range(depth + 1):
+            obj.Link(i)
+        assert obj.Link(depth) == depth + 1
 
 
 class TestStaticDependencies:

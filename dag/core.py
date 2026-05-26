@@ -10,6 +10,7 @@ The DAG tracks dependencies between computed functions and manages:
 
 from __future__ import annotations
 
+import logging
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from .model import Model
 
 
+logger = logging.getLogger(__name__)
+
+
 class NodeState(Enum):
     """State of a node in the DAG."""
     INVALID = auto()       # Value needs recalculation
@@ -42,7 +46,7 @@ class NodeState(Enum):
     ERROR = auto()         # Evaluation resulted in an error
 
 
-@dataclass
+@dataclass(frozen=True)
 class NodeKey:
     """
     Unique identifier for a node in the DAG.
@@ -51,22 +55,13 @@ class NodeKey:
     - The object instance it belongs to
     - The method name
     - The arguments (for parameterized computed functions)
+
+    Frozen so it is hashable and usable as a dict key; equality and hashing
+    are derived from (obj_id, method_name, args).
     """
     obj_id: int              # id() of the Model instance
     method_name: str         # Name of the computed function
     args: Tuple[Any, ...]    # Hashable arguments
-
-    def __hash__(self) -> int:
-        return hash((self.obj_id, self.method_name, self.args))
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, NodeKey):
-            return NotImplemented
-        return (
-            self.obj_id == other.obj_id
-            and self.method_name == other.method_name
-            and self.args == other.args
-        )
 
 
 @dataclass
@@ -396,7 +391,13 @@ class DagManager:
         caller = state.evaluating_node
         if caller is not None and caller.key != node.key:
             if not self._is_untracked_for(caller.key):
-                self._validate_dependency(caller, node)
+                # The parser only detects calls rooted at `self`, so the
+                # static-dependency check can only apply to same-object calls.
+                # Cross-object calls (e.g. iterating a collection of other
+                # models) are impossible to resolve statically; track them at
+                # runtime so invalidation still propagates, but don't reject them.
+                if caller.key.obj_id == node.key.obj_id:
+                    self._validate_dependency(caller, node)
                 self._record_dependency(caller, node)
 
         current_thread_id = threading.get_ident()
@@ -498,8 +499,9 @@ class DagManager:
         """
         Invalidate a node and propagate to dependents.
 
-        When a node is invalidated, all nodes that depend on it
-        must also be invalidated.
+        When a node is invalidated, all nodes that depend on it must also be
+        invalidated. Traversal is iterative (an explicit stack) so that very
+        deep dependency chains do not exceed Python's recursion limit.
 
         Args:
             node: The node to invalidate
@@ -511,14 +513,19 @@ class DagManager:
                 return
             node.invalidate()
 
-        # Propagate to outputs (dependents)
-        for output_key in list(node.outputs):  # list() to avoid mutation during iteration
-            output_node = self.get_node(output_key)
-            if output_node is not None:
-                self.invalidate_node(output_node)
-
-        # Queue subscription notifications
+        # Queue a notification for the starting node, then walk its dependents.
         self._queue_subscription(node.key)
+        stack: List[NodeKey] = list(node.outputs)
+
+        while stack:
+            output_node = self.get_node(stack.pop())
+            # Skip missing nodes and ones already invalid: an invalid node's
+            # dependents were invalidated when it first became invalid.
+            if output_node is None or not output_node.is_valid:
+                continue
+            output_node.invalidate()
+            self._queue_subscription(output_node.key)
+            stack.extend(output_node.outputs)
 
     def invalidate_dependents(self, node: Node) -> None:
         """
@@ -602,7 +609,11 @@ class DagManager:
                     try:
                         cb(node)
                     except Exception:
-                        pass  # Don't let callback errors propagate
+                        # Watch callbacks must not interrupt the DAG, but their
+                        # failures must be visible rather than silently dropped.
+                        logger.exception(
+                            "Watch callback for %r failed", node.method_name
+                        )
 
             with self._subscriptions_lock:
                 self._subscriptions[node_key] = live_callbacks

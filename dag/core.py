@@ -301,7 +301,20 @@ class DagManager:
                     input_node.outputs.add(node.key)
 
     def _validate_dependency(self, from_node: Node, to_node: Node) -> None:
-        """Ensure a runtime dependency was declared statically."""
+        """Ensure a runtime dependency was declared statically.
+
+        Best-effort safety net, called only for same-object calls (cross-object
+        calls cannot be resolved by the AST parser; see ``evaluate``). It is
+        intentionally **name-based**: it confirms the callee's method name is
+        among the names the parser detected being called on ``self``. A missing
+        name raises so the author can declare the dependency; a coincidental
+        match (e.g. a name seen only inside a ``self.x().Method()`` chain) is
+        accepted. That looseness is safe: ``_record_dependency`` records the
+        runtime edge regardless, so invalidation stays correct even when this
+        check lets a call through. Tightening it to only direct ``self.X()``
+        calls would risk false positives on chains whose receiver returns
+        ``self``, for no correctness gain.
+        """
         # None means the parser could not read from_node's source, so its
         # dependencies are unknown: track the call at runtime without rejecting.
         if from_node.static_deps is None:

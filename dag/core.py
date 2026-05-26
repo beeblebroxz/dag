@@ -387,6 +387,7 @@ class DagManager:
         Runtime dependencies are tracked: when node A calls node B during
         evaluation, B is recorded as a dependency of A.
         """
+        self._check_scenario_owner()
         state = self._get_execution_state()
 
         # Track runtime dependency: if we're evaluating another node,
@@ -573,6 +574,12 @@ class DagManager:
                 self._scenario_depth -= 1
                 if self._scenario_depth == 0:
                     self._scenario_owner = None
+
+    def _check_scenario_owner(self) -> None:
+        """Reject DAG access from a thread other than the active scenario owner."""
+        owner = self._scenario_owner  # lock-free single-attribute read (GIL-atomic)
+        if owner is not None and owner != threading.get_ident():
+            raise ConcurrentScenarioError(owner, threading.get_ident())
 
     # Scenario management
     def push_context(self, ctx: Scenario) -> None:

@@ -476,6 +476,50 @@ class TestScenarioThreadGuard:
 
         assert len(errors) == 1
 
+    def test_evaluate_during_foreign_scenario_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() * 2
+
+        obj = M()
+        assert obj.Price() == 200.0  # cache it with the base value
+
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+        observed = []
+
+        def thread_a():
+            with dag.scenario():
+                obj.Spot.override(500.0)
+                observed.append(obj.Price())  # computes 1000 under the override
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                obj.Price()  # no scenario: must not silently see A's overridden value
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert observed == [1000.0]
+        assert len(errors) == 1
+
     def test_release_ownership_ignores_non_owner_thread(self):
         from dag.core import DagManager
 

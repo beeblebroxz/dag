@@ -142,6 +142,7 @@ class ComputedFunctionAccessor:
         """
         if not (self._descriptor.flags & Input):
             raise SetValueError(self._descriptor.name)
+        self._dag._check_scenario_owner()
 
         # Handle inverse if configured
         if self._descriptor.inverse is not None:
@@ -199,6 +200,7 @@ class ComputedFunctionAccessor:
         """Clear any set value, reverting to computed value."""
         if not (self._descriptor.flags & Input):
             raise SetValueError(self._descriptor.name)
+        self._dag._check_scenario_owner()
 
         node = self._get_or_create_node()
         node._set_value = NO_VALUE
@@ -328,6 +330,7 @@ class NodeChange:
 
     def apply(self) -> None:
         """Apply this change."""
+        self.node_accessor._dag._check_scenario_owner()
         # Get the node and set its value directly (bypassing inverse)
         node = self.node_accessor._get_or_create_node()
         node._set_value = self.value

@@ -687,6 +687,7 @@ class Scenario:
 
     def add_tweak(self, node: Node, new_value: Any) -> None:
         """Record an override for later reversion."""
+        self._dag._check_scenario_owner()
         old_value = self._dag.get_tweak_value(node.key)
         self._tweaks.append((node, old_value))
         self._dag.set_tweak_value(node.key, new_value)

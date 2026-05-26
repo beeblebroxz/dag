@@ -520,6 +520,123 @@ class TestScenarioThreadGuard:
         assert observed == [1000.0]
         assert len(errors) == 1
 
+    def test_set_during_foreign_scenario_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Input)
+            def X(self):
+                return 1
+
+            @dag.computed(dag.Overridable)
+            def Y(self):
+                return 2
+
+        obj = M()
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+
+        def thread_a():
+            with dag.scenario():
+                obj.Y.override(5)
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                obj.X.set(99)  # permanent mutation must not run during a foreign scenario
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert len(errors) == 1
+
+    def test_node_change_apply_during_foreign_scenario_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Input)
+            def X(self):
+                return 1
+
+            @dag.computed(dag.Overridable)
+            def Y(self):
+                return 2
+
+        obj = M()
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+
+        def thread_a():
+            with dag.scenario():
+                obj.Y.override(5)
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                dag.NodeChange(obj.X, 99).apply()
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert len(errors) == 1
+
+    def test_clearvalue_during_foreign_scenario_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Input)
+            def X(self):
+                return 1
+
+            @dag.computed(dag.Overridable)
+            def Y(self):
+                return 2
+
+        obj = M()
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+
+        def thread_a():
+            with dag.scenario():
+                obj.Y.override(5)
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                obj.X.clearValue()
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert len(errors) == 1
+
     def test_release_ownership_ignores_non_owner_thread(self):
         from dag.core import DagManager
 

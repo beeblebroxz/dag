@@ -62,6 +62,23 @@ class ScenarioError(DagError):
     pass
 
 
+class ConcurrentScenarioError(ScenarioError):
+    """Raised when a scenario or branch is used concurrently across threads.
+
+    Scenarios and branches are single-threaded. While one is active on a
+    thread, the DAG must not be evaluated or mutated from another thread.
+    """
+
+    def __init__(self, owner_thread: int, current_thread: int):
+        self.owner_thread = owner_thread
+        self.current_thread = current_thread
+        super().__init__(
+            f"A scenario/branch is active on thread {owner_thread}; the DAG "
+            f"cannot be used concurrently from thread {current_thread}. "
+            "Scenarios and branches are single-threaded."
+        )
+
+
 class EvaluationError(DagError):
     """Raised when there's an error during computed function evaluation."""
 

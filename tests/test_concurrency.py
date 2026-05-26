@@ -392,3 +392,18 @@ class TestParallelComputation:
 
         assert len(errors) == 0
         assert len(results) == 5
+
+
+class TestScenarioThreadGuard:
+    """Scenarios/branches are single-threaded; concurrent use fails fast."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_concurrent_scenario_error_is_scenario_error(self):
+        err = dag.ConcurrentScenarioError(111, 222)
+        assert isinstance(err, dag.ScenarioError)
+        assert err.owner_thread == 111
+        assert err.current_thread == 222
+        assert "111" in str(err)
+        assert "222" in str(err)

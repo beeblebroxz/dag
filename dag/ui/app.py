@@ -7,7 +7,7 @@ Provides event loop integration with automatic subscription dispatching.
 from __future__ import annotations
 
 import tkinter as tk
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import dag
 from .bindings import (
@@ -18,8 +18,6 @@ from .bindings import (
     Formatter,
     Parser,
     ErrorHandler,
-    default_formatter,
-    float_parser,
 )
 
 if TYPE_CHECKING:

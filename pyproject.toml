@@ -66,6 +66,6 @@ ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.9"
-files = ["dag/core.py", "dag/decorators.py", "dag/state.py"]
+files = ["dag"]
 check_untyped_defs = true
 warn_unused_configs = true

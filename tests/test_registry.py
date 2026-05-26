@@ -115,7 +115,7 @@ class TestRegistryMixin:
 
         db = Registry()
         db.register('Other', Other)
-        other = db.new('Other', '/other')
+        db.new('Other', '/other')
 
         WithDb.set_registry(db)
 

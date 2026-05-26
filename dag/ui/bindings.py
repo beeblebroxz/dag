@@ -10,7 +10,7 @@ This module provides three types of bindings:
 from __future__ import annotations
 
 import tkinter as tk
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from ..decorators import ComputedFunctionAccessor

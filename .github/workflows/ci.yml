@@ -68,7 +68,7 @@ jobs:
 
     - name: Lint with Ruff
       run: |
-        ruff check dag/core.py dag/decorators.py dag/state.py tests/test_concurrency.py tests/test_deps.py tests/test_edge_cases.py tests/test_state.py tests/test_ui_bindings.py tests/test_untracked.py
+        ruff check dag/ tests/
 
   typecheck:
     runs-on: ubuntu-latest

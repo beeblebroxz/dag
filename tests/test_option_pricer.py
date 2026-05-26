@@ -394,7 +394,9 @@ class TestDAGReactivity:
         option = BlackScholesOption()
 
         callback_count = [0]
-        callback_ref = lambda node: callback_count.__setitem__(0, callback_count[0] + 1)
+
+        def callback_ref(node):
+            callback_count[0] += 1
 
         # Watch Price for changes
         option.Price.watch(callback_ref)

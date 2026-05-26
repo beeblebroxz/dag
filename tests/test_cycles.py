@@ -5,7 +5,6 @@ Note: CycleError is wrapped in EvaluationError when it propagates up the call st
 These tests verify that cycles are detected by checking for either exception type.
 """
 
-import pytest
 import dag
 
 

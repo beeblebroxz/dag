@@ -8,8 +8,7 @@ reactive interfaces with minimal code.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .bindings import (
     Formatter,
@@ -17,8 +16,6 @@ from .bindings import (
     ErrorHandler,
     default_formatter,
     float_parser,
-    int_parser,
-    str_parser,
 )
 
 if TYPE_CHECKING:
@@ -405,6 +402,7 @@ class ModelInspector(tk.Frame):
             from ..flags import Input
             is_settable = descriptor.flags & Input
 
+            widget: tk.Frame
             if is_settable and show_inputs:
                 widget = CellInput(self, name, cell, app)
                 widget.grid(row=row, column=0, sticky='w', pady=2)

@@ -28,7 +28,7 @@ from typing import (
     Tuple,
 )
 
-from .exceptions import CycleError, EvaluationError, UntrackedError
+from .exceptions import ConcurrentScenarioError, CycleError, EvaluationError, UntrackedError
 from .flags import NO_VALUE, Flags
 
 if TYPE_CHECKING:
@@ -196,6 +196,9 @@ class DagManager:
         self._layer_lock = threading.Lock()
         self._subscriptions: Dict[NodeKey, List[weakref.ref]] = {}
         self._subscriptions_lock = threading.RLock()
+        self._scenario_owner: Optional[int] = None
+        self._scenario_depth: int = 0
+        self._scenario_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> DagManager:
@@ -549,6 +552,28 @@ class DagManager:
         from_node.inputs.discard(to_node.key)
         to_node.outputs.discard(from_node.key)
 
+    def _claim_scenario_ownership(self) -> None:
+        """Claim scenario/branch ownership for the current thread (fail-fast on conflict)."""
+        tid = threading.get_ident()
+        with self._scenario_lock:
+            if self._scenario_owner is None:
+                self._scenario_owner = tid
+                self._scenario_depth = 1
+            elif self._scenario_owner == tid:
+                self._scenario_depth += 1
+            else:
+                raise ConcurrentScenarioError(self._scenario_owner, tid)
+
+    def _release_scenario_ownership(self) -> None:
+        """Release one level of scenario/branch ownership for the current thread."""
+        with self._scenario_lock:
+            if self._scenario_owner != threading.get_ident():
+                return  # only the owning thread may release; ignore foreign/no-op calls
+            if self._scenario_depth > 0:
+                self._scenario_depth -= 1
+                if self._scenario_depth == 0:
+                    self._scenario_owner = None
+
     # Scenario management
     def push_context(self, ctx: Scenario) -> None:
         """Push a new scenario onto the stack."""
@@ -619,7 +644,6 @@ class DagManager:
                 self._subscriptions[node_key] = live_callbacks
 
 
-
 class Scenario:
     """
     A scenario for temporary overrides.
@@ -634,21 +658,24 @@ class Scenario:
         self._layer_id = self._dag.next_layer_id()
 
     def __enter__(self) -> Scenario:
+        self._dag._claim_scenario_ownership()
         self._dag.push_context(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
-        # Revert all overrides
-        for node, old_value in reversed(self._tweaks):
-            self._dag.set_tweak_value(node.key, old_value)
-            # Always invalidate dependents when reverting an override
-            # The node's dependents need to recompute with the original value
-            self._dag.invalidate_dependents(node)
-            if old_value is NO_VALUE:
-                # Also invalidate this node since we're reverting to computed value
-                node.invalidate()
-
-        self._dag.pop_context()
+        try:
+            # Revert all overrides
+            for node, old_value in reversed(self._tweaks):
+                self._dag.set_tweak_value(node.key, old_value)
+                # Always invalidate dependents when reverting an override
+                # The node's dependents need to recompute with the original value
+                self._dag.invalidate_dependents(node)
+                if old_value is NO_VALUE:
+                    # Also invalidate this node since we're reverting to computed value
+                    node.invalidate()
+        finally:
+            self._dag.pop_context()
+            self._dag._release_scenario_ownership()
         return False
 
     def add_tweak(self, node: Node, new_value: Any) -> None:

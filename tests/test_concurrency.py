@@ -195,47 +195,6 @@ class TestThreadSafety:
         # All should be the same instance
         assert all(inst is instances[0] for inst in instances)
 
-    def test_concurrent_context_creation(self):
-        """Test creating scenarios from multiple threads."""
-        errors = []
-        contexts_created = []
-        start = threading.Barrier(5)
-
-        class Simple(dag.Model):
-            @dag.computed(dag.Overridable)
-            def Value(self):
-                return 1
-
-        obj = Simple()
-
-        def use_context(thread_id):
-            try:
-                with dag.scenario():
-                    obj.Value.override(thread_id)
-                    start.wait()
-                    value = obj.Value()
-                    contexts_created.append((thread_id, value))
-                    time.sleep(0.01)
-                    # Verify still overridden
-                    assert obj.Value() == thread_id
-            except Exception as e:
-                errors.append((thread_id, e))
-
-        threads = [
-            threading.Thread(target=use_context, args=(i,))
-            for i in range(5)
-        ]
-
-        for t in threads:
-            t.start()
-
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-        assert sorted(contexts_created) == [(i, i) for i in range(5)]
-        assert obj.Value() == 1
-
 
 class TestConcurrentInvalidation:
     """Test concurrent invalidation scenarios."""
@@ -407,3 +366,132 @@ class TestScenarioThreadGuard:
         assert err.current_thread == 222
         assert "111" in str(err)
         assert "222" in str(err)
+
+    def test_concurrent_scenario_enter_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Overridable)
+            def V(self):
+                return 1
+
+        obj = M()
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+
+        def thread_a():
+            with dag.scenario():
+                obj.V.override(5)
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                with dag.scenario():
+                    pass
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert len(errors) == 1
+
+    def test_nested_scenarios_same_thread_ok(self):
+        class M(dag.Model):
+            @dag.computed(dag.Overridable)
+            def V(self):
+                return 1
+
+        obj = M()
+        with dag.scenario():
+            obj.V.override(2)
+            with dag.scenario():
+                obj.V.override(3)
+                assert obj.V() == 3
+            assert obj.V() == 2
+        assert obj.V() == 1
+
+    def test_scenario_ownership_released_after_exit(self):
+        class M(dag.Model):
+            @dag.computed(dag.Overridable)
+            def V(self):
+                return 1
+
+        obj = M()
+        with dag.scenario():
+            obj.V.override(5)
+
+        result = []
+
+        def worker():
+            with dag.scenario():
+                obj.V.override(9)
+                result.append(obj.V())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+        assert result == [9]
+
+    def test_concurrent_branch_enter_raises(self):
+        class M(dag.Model):
+            @dag.computed(dag.Overridable)
+            def V(self):
+                return 1
+
+        obj = M()
+        a_in = threading.Event()
+        release_a = threading.Event()
+        errors = []
+
+        def thread_a():
+            with dag.branch():
+                obj.V.override(5)
+                a_in.set()
+                release_a.wait(timeout=2)
+
+        def thread_b():
+            a_in.wait(timeout=2)
+            try:
+                with dag.branch():
+                    pass
+            except dag.ConcurrentScenarioError as e:
+                errors.append(e)
+            finally:
+                release_a.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        assert len(errors) == 1
+
+    def test_release_ownership_ignores_non_owner_thread(self):
+        from dag.core import DagManager
+
+        mgr = DagManager.get_instance()
+        mgr._claim_scenario_ownership()  # main thread owns it
+        try:
+            def foreign_release():
+                mgr._release_scenario_ownership()
+
+            t = threading.Thread(target=foreign_release)
+            t.start()
+            t.join()
+
+            # A non-owning thread must not be able to clear/decrement ownership.
+            assert mgr._scenario_owner == threading.get_ident()
+            assert mgr._scenario_depth == 1
+        finally:
+            mgr._release_scenario_ownership()  # owner releases
+        assert mgr._scenario_owner is None

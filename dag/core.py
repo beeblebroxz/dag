@@ -408,30 +408,15 @@ class DagManager:
         cycle_error: Optional[CycleError] = None
 
         with node._condition:
-            has_override, override_value = self._get_effective_value(node)
-            if has_override:
-                return override_value
-
-            if node.is_valid:
-                return node.value
-
-            if node.key in state.eval_stack:
-                cycle_path = state.eval_stack[state.eval_stack.index(node.key):]
-                cycle_str = " -> ".join(k.method_name for k in cycle_path)
-                cycle_error = CycleError(
-                    f"Cyclic dependency detected: {cycle_str} -> {node.key.method_name}"
-                )
-            else:
-                while (
-                    node.state == NodeState.EVALUATING
-                    and node._evaluating_thread_id != current_thread_id
-                ):
-                    node._condition.wait()
-                    has_override, override_value = self._get_effective_value(node)
-                    if has_override:
-                        return override_value
-                    if node.is_valid:
-                        return node.value
+            # Re-checked on every iteration: after waking from wait() the node
+            # may have become valid/overridden, failed into ERROR, or revealed a
+            # cycle, so all conditions are re-evaluated from the top.
+            while True:
+                has_override, override_value = self._get_effective_value(node)
+                if has_override:
+                    return override_value
+                if node.is_valid:
+                    return node.value
 
                 if node.key in state.eval_stack:
                     cycle_path = state.eval_stack[state.eval_stack.index(node.key):]
@@ -439,16 +424,20 @@ class DagManager:
                     cycle_error = CycleError(
                         f"Cyclic dependency detected: {cycle_str} -> {node.key.method_name}"
                     )
-                else:
-                    has_override, override_value = self._get_effective_value(node)
-                    if has_override:
-                        return override_value
+                    break
 
-                    if node.is_valid:
-                        return node.value
+                # Another thread is computing this node: release the lock and
+                # wait, then loop back to re-check the conditions above.
+                if (
+                    node.state == NodeState.EVALUATING
+                    and node._evaluating_thread_id != current_thread_id
+                ):
+                    node._condition.wait()
+                    continue
 
-                    node._state = NodeState.EVALUATING
-                    node._evaluating_thread_id = current_thread_id
+                node._state = NodeState.EVALUATING
+                node._evaluating_thread_id = current_thread_id
+                break
 
         if cycle_error is not None:
             raise cycle_error

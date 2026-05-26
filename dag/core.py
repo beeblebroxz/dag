@@ -88,8 +88,9 @@ class Node:
     _error: Optional[Exception] = field(default=None, repr=False)
 
     # Dependency tracking
-    # Static dependencies detected at parse time
-    static_deps: FrozenSet[str] = field(default_factory=frozenset)
+    # Static dependencies detected at parse time (None = source unparseable,
+    # so dependencies are unknown and the untracked check is skipped).
+    static_deps: Optional[FrozenSet[str]] = field(default_factory=frozenset)
     # Runtime input edges (nodes we depend on)
     inputs: Set[NodeKey] = field(default_factory=set)
     # Runtime output edges (nodes that depend on us)
@@ -300,6 +301,10 @@ class DagManager:
 
     def _validate_dependency(self, from_node: Node, to_node: Node) -> None:
         """Ensure a runtime dependency was declared statically."""
+        # None means the parser could not read from_node's source, so its
+        # dependencies are unknown: track the call at runtime without rejecting.
+        if from_node.static_deps is None:
+            return
         if to_node.method_name in from_node.static_deps:
             return
 
@@ -346,7 +351,7 @@ class DagManager:
         method_name: str,
         func: Callable,
         flags: int = Flags.NONE,
-        static_deps: FrozenSet[str] = frozenset(),
+        static_deps: Optional[FrozenSet[str]] = frozenset(),
         args: Tuple[Any, ...] = (),
     ) -> Node:
         """Get an existing node or create a new one."""

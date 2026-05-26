@@ -67,7 +67,7 @@ class ComputedFunctionDescriptor:
         func: Callable,
         flags: int = Flags.NONE,
         inverse: Optional[Callable] = None,
-        static_deps: FrozenSet[str] = frozenset(),
+        static_deps: Optional[FrozenSet[str]] = frozenset(),
     ):
         self.func = func
         self.flags = flags

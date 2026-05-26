@@ -152,7 +152,7 @@ def _get_source_from_registry(func: Callable) -> Optional[str]:
     return None
 
 
-def parse_dependencies(func: Callable) -> FrozenSet[str]:
+def parse_dependencies(func: Callable) -> Optional[FrozenSet[str]]:
     """
     Parse a cell function to extract its dependencies.
 
@@ -160,7 +160,11 @@ def parse_dependencies(func: Callable) -> FrozenSet[str]:
         func: The cell function to parse
 
     Returns:
-        A frozenset of dependency method names
+        A frozenset of dependency method names, or None if the source could not
+        be retrieved or parsed. None means "dependencies unknown" and is
+        distinct from an empty frozenset ("parsed successfully, no dependencies
+        found"). Callers use None to skip strict dependency enforcement, since
+        the parser cannot vouch for a function whose source it could not read.
     """
     source = None
 
@@ -171,7 +175,7 @@ def parse_dependencies(func: Callable) -> FrozenSet[str]:
         # Fallback for Pyodide: check source registry
         source = _get_source_from_registry(func)
         if source is None:
-            return frozenset()
+            return None
 
     # Dedent the source in case it's a method defined inside a class
     source = textwrap.dedent(source)
@@ -180,7 +184,7 @@ def parse_dependencies(func: Callable) -> FrozenSet[str]:
         tree = ast.parse(source)
     except SyntaxError:
         # Can't parse the source
-        return frozenset()
+        return None
 
     # Find the function definition
     func_def = None
@@ -190,7 +194,7 @@ def parse_dependencies(func: Callable) -> FrozenSet[str]:
             break
 
     if func_def is None:
-        return frozenset()
+        return None
 
     # Get the 'self' parameter name (usually 'self' but could be different)
     self_name = "self"

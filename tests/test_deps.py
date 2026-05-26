@@ -2,6 +2,8 @@
 Tests for dependency tracking and AST parsing.
 """
 
+import textwrap
+
 import pytest
 import dag
 from dag.parser import parse_dependencies, parse_dependencies_detailed
@@ -354,3 +356,50 @@ class TestStaticDependencies:
 
         with pytest.raises(dag.UntrackedError):
             obj.B()
+
+    def test_unparseable_source_is_tracked_not_rejected(self):
+        """If a computed function's source can't be retrieved (e.g. exec'd code
+        with no file backing), its dependencies can't be parsed. Such calls must
+        be tracked at runtime rather than rejected as undeclared."""
+        source = textwrap.dedent('''
+            import dag
+
+            class Dynamic(dag.Model):
+                @dag.computed(dag.Input)
+                def A(self):
+                    return 1
+
+                @dag.computed
+                def B(self):
+                    return self.A() + 1
+        ''')
+        namespace = {}
+        exec(compile(source, '<dynamic-test>', 'exec'), namespace)
+        obj = namespace['Dynamic']()
+
+        # getsource('<dynamic-test>') fails, so B's deps are unknown; calling
+        # self.A() must still work (tracked, not rejected with UntrackedError).
+        assert obj.B() == 2
+
+        # The runtime dependency edge is still recorded, so invalidation works.
+        obj.A.set(5)
+        assert obj.B() == 6
+
+    def test_parse_dependencies_returns_none_when_source_unavailable(self):
+        """parse_dependencies signals 'unknown' (None) when it cannot read the
+        source, distinct from an empty set meaning 'parsed, no dependencies'."""
+        source = textwrap.dedent('''
+            def standalone(self):
+                return self.A() + self.B()
+        ''')
+        namespace = {}
+        exec(compile(source, '<dynamic-test>', 'exec'), namespace)
+
+        assert parse_dependencies(namespace['standalone']) is None
+
+        # A normally-defined function with no detectable deps returns an empty
+        # set (parsed successfully), NOT None.
+        def no_deps(self):
+            return 42
+
+        assert parse_dependencies(no_deps) == frozenset()

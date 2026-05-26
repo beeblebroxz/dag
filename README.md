@@ -195,12 +195,15 @@ class Instrument(dag.Model):
     def Price(self):
         return 0.0
 
-class InstrumentRegistry(dag.Registry[str, Instrument]):
-    pass
+registry = dag.Registry()
+registry.register('Instrument', Instrument)
 
-registry = InstrumentRegistry()
-registry["AAPL"].Price.set(150.0)
-registry["GOOGL"].Price.set(140.0)
+# Create instances stored at a path...
+aapl = registry.new('Instrument', '/AAPL')
+aapl.Price.set(150.0)
+
+# ...and look them up by path later.
+assert registry['/AAPL'].Price() == 150.0
 ```
 
 ### Branches

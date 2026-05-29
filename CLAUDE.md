@@ -141,7 +141,7 @@ The parser guesses at references to other computed functions starting from known
 - **Star args:** `self.A(*self.Args())`
 
 **Runtime Dependencies (untracked mode):**
-- The DAG throws an exception if you call a computed function not detected at parse time
+- The DAG throws an exception if you call a computed function **on `self`** that wasn't detected at parse time (cross-object calls on other models can't be resolved statically, so they are tracked at runtime instead of rejected)
 - Without this check, you'd miss a dependency and get invalid cached results
 - Use `dag.untracked()` only if you're certain you don't want a dependency tracked
 - Do not use it to work around exceptions
@@ -205,7 +205,9 @@ def Spot(self):
 
 **Scenarios vs Branches:**
 - **Scenarios** allow you to temporarily change the current state of the graph
-- **Branches** allow multiple parallel states of the graph to exist simultaneously
+- **Branches** allow multiple parallel states of the graph to coexist (used sequentially within a single thread)
+
+**Single-threaded:** scenarios and branches are single-threaded. While one is active on a thread, evaluating or mutating the DAG from another thread raises `ConcurrentScenarioError` (fail-fast) rather than returning cache-poisoned values, enforced by a scenario-ownership guard in `DagManager`. They are not a mechanism for parallel cross-thread computation.
 
 **Branch Characteristics:**
 - The DAG implements branches efficiently by sharing nodes across branches where possible

@@ -80,7 +80,7 @@ When computed functions call other computed functions, dependencies are automati
 
 ```python
 class Option(dag.Model):
-    @dag.computed(dag.Input)
+    @dag.computed(dag.Overridable)
     def Spot(self):
         return 100.0
 
@@ -111,6 +111,11 @@ with dag.scenario():
 print(opt.Intrinsic())  # 0.0 (reverted)
 ```
 
+> **Concurrency:** scenarios (and branches) are single-threaded. While one is
+> active on a thread, evaluating or mutating the DAG from another thread raises
+> `ConcurrentScenarioError` instead of risking inconsistent (cache-poisoned)
+> results. Run independent what-if calculations sequentially.
+
 ### Watches
 
 Watch computed functions to be notified when they change:
@@ -119,10 +124,18 @@ Watch computed functions to be notified when they change:
 def on_change(node):
     print(f"{node.method_name} changed!")
 
+# Evaluate once so the DAG learns that Total depends on Quantity.
+calc.Total()
 calc.Total.watch(on_change)
+
 calc.Quantity.set(50)
-dag.flush()  # Triggers: "Total changed!"
+dag.flush()  # Triggers: "Total changed!" (once per change)
 ```
+
+Watches fire **once per change** and are dispatched by `dag.flush()`. To be
+notified again, the callback must re-evaluate the node (reading its value
+re-arms the watch); and the watched function must have been evaluated at least
+once so the DAG knows its dependencies.
 
 ## UI Bindings
 
@@ -208,7 +221,8 @@ assert registry['/AAPL'].Price() == 150.0
 
 ### Branches
 
-Branches provide persistent override scopes for parallel scenario analysis:
+Branches are persistent override scopes that coexist and can be re-entered
+(single-threaded, like scenarios — see the concurrency note above):
 
 ```python
 stressed_branch = dag.Branch()

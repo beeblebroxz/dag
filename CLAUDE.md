@@ -93,7 +93,7 @@ Models are the fundamental building blocks:
 - Standard procedural member functions are supported alongside computed functions
 - `@dag.computed` decorator defines a computed function
 - Mutually dependent values can be handled via `inverse` functions
-- Persistence is built in - anything marked as `Persisted` will be automatically serialized
+- Persistence was a design goal: `Persisted` (== `Input | Serialized`) marks values for serialization, but no persistence layer is currently implemented (`Serialized` is a declarative marker; the `Input` bit is what makes `Persisted` cells settable)
 - Watches notify when recalculations are required (but cannot intercept them)
 
 ### Computed Functions
@@ -123,7 +123,7 @@ Given computed functions where `C = self.A() + self.B()`, `A = self.B() + 1`, an
 ```python
 @dag.computed(dag.Input)        # This function can be permanently set
 @dag.computed(dag.Overridable)  # This function can be temporarily overridden
-@dag.computed(dag.Serialized)   # The result will be serialized
+@dag.computed(dag.Serialized)   # Serialization marker (no built-in persistence)
 @dag.computed(dag.Persisted)    # == dag.Input | dag.Serialized
 @dag.computed(dag.Optional)     # Return dag.NO_VALUE instead of raising exceptions
 ```
@@ -197,7 +197,7 @@ def Spot(self):
 - Cannot be used to intercept the flow of control
 - Notification mechanism to enable updates to external views (like UIs)
 - Are lazy and cumulative - only one notification per traversal
-- **Callbacks are weakly held** - keep strong references to prevent garbage collection
+- **Callbacks are weakly held** - bound methods are held via `WeakMethod` (the watch dies with its owner); plain functions/lambdas need a strong reference somewhere
 - Dispatched on demand using `dag.flush()`
 - Callbacks must evaluate the node if they expect to be called again (otherwise node stays dirty)
 
@@ -254,14 +254,14 @@ with dag.branch() as b2:
 ## Important Implementation Details
 
 ### Weak References
-The watch system uses `weakref.ref()` for callbacks. When creating bindings, keep strong references to callback methods to prevent garbage collection:
-```python
-self._callback_ref = self._on_change  # Keep strong reference
-computed_func.watch(self._callback_ref)
-```
+Watch callbacks are weakly held. Bound methods are held via `weakref.WeakMethod`,
+so `computed_func.watch(self._on_change)` works directly and the subscription
+dies with its owner. Plain functions/lambdas/closures still need a strong
+reference somewhere for as long as the watch should live. Use
+`computed_func.unwatch(callback)` to remove a subscription explicitly.
 
 ### Node States
 Nodes can be: `INVALID`, `EVALUATING`, `VALID`, `ERROR`
 
 ### Cycle Detection
-Cycles are detected during evaluation and raise `CycleError` (wrapped in `EvaluationError`)
+Cycles are detected during evaluation and raise `CycleError` (wrapped in `EvaluationError`). Mutually-dependent nodes evaluated from two threads are caught by a wait-for-graph check and also raise `CycleError` instead of deadlocking.

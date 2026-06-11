@@ -114,7 +114,9 @@ print(opt.Intrinsic())  # 0.0 (reverted)
 > **Concurrency:** scenarios (and branches) are single-threaded. While one is
 > active on a thread, evaluating or mutating the DAG from another thread raises
 > `ConcurrentScenarioError` instead of risking inconsistent (cache-poisoned)
-> results. Run independent what-if calculations sequentially.
+> results. Run independent what-if calculations sequentially. Plain evaluation
+> may happen from multiple threads; if two threads' evaluations turn out to
+> depend on each other, the DAG raises `CycleError` instead of deadlocking.
 
 ### Watches
 
@@ -136,6 +138,12 @@ Watches fire **once per change** and are dispatched by `dag.flush()`. To be
 notified again, the callback must re-evaluate the node (reading its value
 re-arms the watch); and the watched function must have been evaluated at least
 once so the DAG knows its dependencies.
+
+Callbacks are weakly held, so a watch never keeps its owner alive. Bound
+methods may be passed directly (`calc.Total.watch(self._on_change)`) — the
+subscription dies with the owning object. Plain functions, lambdas, and
+closures need a live reference somewhere for as long as the watch should
+fire. Remove a watch explicitly with `calc.Total.unwatch(on_change)`.
 
 ## UI Bindings
 
@@ -198,6 +206,16 @@ class Portfolio(dag.Model):
         return self.Price("AAPL") + self.Price("GOOGL")
 ```
 
+Each distinct argument value gets its own node. To set, override, watch, or
+clear a specific parameterization, pass the call arguments after the
+value/callback:
+
+```python
+p = Portfolio()
+p.Price.set(155.0, "AAPL")   # targets the Price("AAPL") node
+p.TotalValue()                # 295.0
+```
+
 ### Registry Pattern
 
 Create indexed collections of objects:
@@ -251,13 +269,21 @@ result = dag.untracked(lambda: model.Compute())
 - `@dag.computed` - Mark a method as a computed function
 - `@dag.computed(dag.Input)` - Allow permanent value changes
 - `@dag.computed(dag.Overridable)` - Allow temporary overrides
-- `@dag.computed(dag.Optional)` - Return `dag.NO_VALUE` on errors
+- `@dag.computed(dag.Optional)` - Return `dag.NO_VALUE` on errors (the
+  result is cached like any other; call `func.invalidate()` to retry)
 
 ### Computed Function Methods
-- `func.set(value)` - Set a permanent value (requires Input)
-- `func.override(value)` - Set a temporary value (requires Overridable)
-- `func.watch(callback)` - Watch for changes
-- `func()` - Get the current value
+- `func(*args)` - Get the current value
+- `func.set(value, *args)` - Set a permanent value (requires Input)
+- `func.override(value, *args)` - Set a temporary value (requires Overridable)
+- `func.clearValue(*args)` - Clear a set value, reverting to the computed value
+- `func.invalidate(*args)` - Force a recompute on next evaluation (refresh
+  hook for cells that read external data)
+- `func.watch(callback, *args)` - Watch for changes
+- `func.unwatch(callback, *args)` - Remove a watch callback
+
+For parameterized computed functions, `*args` selects the parameterization,
+e.g. `obj.Price.set(155.0, "AAPL")`.
 
 ### Context Managers
 - `dag.scenario()` - Create a scenario for temporary overrides

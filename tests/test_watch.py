@@ -364,3 +364,74 @@ class TestSubscriptions:
         obj.Value = 7
         dag.flush()
         assert len(calls) == 2
+
+
+class TestWatchOnChangedNodeItself:
+    """Watchers of the node being overridden/set/cleared must be notified,
+    not only watchers of its dependents (audit 2026-06 #1/#7/#9)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_override_notifies_watchers_of_overridden_node(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+        m = Market()
+        events = []
+
+        def on_spot(node):
+            events.append(m.Spot())  # evaluate to re-arm
+
+        m.Spot.watch(on_spot)
+        m.Spot()  # prime
+
+        with dag.scenario():
+            m.Spot.override(120.0)
+            dag.flush()
+            assert events == [120.0]
+
+        dag.flush()
+        assert events == [120.0, 100.0]  # revert also notifies
+
+    def test_clear_value_notifies_watchers(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Input)
+            def Spot(self):
+                return 100.0
+
+        m = Market()
+        events = []
+
+        def on_spot(node):
+            events.append(m.Spot())
+
+        m.Spot.watch(on_spot)
+        m.Spot.set(120.0)  # set before any evaluation
+        dag.flush()
+        assert events == [120.0]
+
+        m.Spot.clearValue()
+        dag.flush()
+        assert events == [120.0, 100.0]
+
+    def test_node_change_apply_notifies_watchers(self):
+        from dag.decorators import NodeChange
+
+        class Market(dag.Model):
+            @dag.computed(dag.Input)
+            def Spot(self):
+                return 100.0
+
+        m = Market()
+        events = []
+
+        def on_spot(node):
+            events.append(m.Spot())
+
+        m.Spot.watch(on_spot)
+        NodeChange(m.Spot, 120.0).apply()  # node never evaluated before
+        dag.flush()
+        assert events == [120.0]

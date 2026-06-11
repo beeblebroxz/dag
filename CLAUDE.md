@@ -125,7 +125,7 @@ Given computed functions where `C = self.A() + self.B()`, `A = self.B() + 1`, an
 @dag.computed(dag.Overridable)  # This function can be temporarily overridden
 @dag.computed(dag.Serialized)   # The result will be serialized
 @dag.computed(dag.Persisted)    # == dag.Input | dag.Serialized
-@dag.computed(dag.Optional)     # Return None instead of raising exceptions
+@dag.computed(dag.Optional)     # Return dag.NO_VALUE instead of raising exceptions
 ```
 
 ### Parser and Dependency Detection

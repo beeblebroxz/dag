@@ -2,6 +2,8 @@
 Tests for inverse handlers.
 """
 
+import pytest
+
 import dag
 from dag.decorators import NodeChange
 
@@ -237,3 +239,58 @@ class TestNodeChangeClass:
         change_b.apply()
         assert obj.A() == 10
         assert obj.B() == 20
+
+
+class TestInverseChangeFormats:
+    """set() and override() must accept the same inverse change formats, and
+    must raise on unsupported formats instead of silently ignoring them
+    (audit 2026-06 #4/#9)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _linked_model(self, change_factory):
+        class Linked(dag.Model):
+            @dag.computed(dag.Input)
+            def Raw(self):
+                return 0.0
+
+            @dag.computed(dag.Input | dag.Overridable,
+                          inverse=lambda self, v: change_factory(self, v))
+            def Adjusted(self):
+                return self.Raw() + 1
+
+        return Linked()
+
+    def test_override_supports_tuple_format_changes(self):
+        obj = self._linked_model(lambda self, v: [(lambda: self.Raw, v - 1)])
+
+        with dag.scenario():
+            obj.Adjusted.override(20.0)
+            assert obj.Raw() == 19.0
+            assert obj.Adjusted() == 20.0
+
+        # Tweak reverts with the scenario.
+        assert obj.Raw() == 0.0
+        assert obj.Adjusted() == 1.0
+
+    def test_set_rejects_unsupported_change_format(self):
+        obj = self._linked_model(lambda self, v: ["garbage"])
+        with pytest.raises(dag.SetValueError):
+            obj.Adjusted.set(10.0)
+
+    def test_override_rejects_unsupported_change_format(self):
+        obj = self._linked_model(lambda self, v: ["garbage"])
+        with dag.scenario():
+            with pytest.raises(dag.OverrideError):
+                obj.Adjusted.override(10.0)
+
+    def test_node_change_apply_requires_input_flag(self):
+        class Fixed(dag.Model):
+            @dag.computed  # NOT Input
+            def Value(self):
+                return 1.0
+
+        obj = Fixed()
+        with pytest.raises(dag.SetValueError):
+            NodeChange(obj.Value, 2.0).apply()

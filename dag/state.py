@@ -23,9 +23,29 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal,
 
 from .core import Scenario, DagManager, scenario as create_scenario
 from .decorators import ComputedFunctionAccessor
+from .exceptions import OverrideError, ScenarioError
+from .flags import Overridable
 
 if TYPE_CHECKING:
     from .model import Model
+
+
+def _overridable_accessor(obj: Model, method_name: str) -> ComputedFunctionAccessor:
+    """Resolve obj.method_name to an Overridable computed-function accessor.
+
+    Shared by every name-based override path (Branch.override,
+    OverrideSet.apply) so they enforce the same Overridable rule as
+    ``accessor.override()`` and create nodes through the accessor (which
+    carries the descriptor's parsed static dependencies).
+    """
+    accessor = getattr(obj, method_name, None)
+    if not isinstance(accessor, ComputedFunctionAccessor):
+        raise OverrideError(
+            method_name, f"'{method_name}' is not a computed function"
+        )
+    if not (accessor._descriptor.flags & Overridable):
+        raise OverrideError(method_name)
+    return accessor
 
 
 @dataclass
@@ -59,19 +79,14 @@ class OverrideSet:
         self.overrides.append(Override(obj=obj, method_name=method_name, value=value, args=args))
 
     def apply(self, ctx: Scenario) -> None:
-        """Apply all overrides in this set to the given scenario."""
-        dag = DagManager.get_instance()
+        """Apply all overrides in this set to the given scenario.
+
+        Every target must be a computed function with the Overridable flag —
+        the same rule ``accessor.override()`` enforces.
+        """
         for override in self.overrides:
-            accessor = getattr(override.obj, override.method_name)
-            if isinstance(accessor, ComputedFunctionAccessor):
-                node = dag.get_or_create_node(
-                    obj=override.obj,
-                    method_name=override.method_name,
-                    func=accessor._descriptor.func,
-                    flags=accessor._descriptor.flags,
-                    args=override.args,
-                )
-                ctx.add_tweak(node, override.value)
+            accessor = _overridable_accessor(override.obj, override.method_name)
+            ctx.add_tweak(accessor._get_or_create_node(override.args), override.value)
 
 
 class Branch:
@@ -90,39 +105,39 @@ class Branch:
         self._branch_id = self._dag.next_layer_id()
         self._parent = parent
         self._overrides: Dict[Tuple[int, str, Tuple[Any, ...]], Override] = {}
-        self._scenario: Optional[BranchScenario] = None
+        # Stack of active scenarios: branches are re-entrant, including
+        # nested re-entry while already active (with b: ... with b: ...).
+        self._scenarios: List[BranchScenario] = []
 
     def __enter__(self) -> Branch:
-        # Create a scenario for this branch and replay persisted overrides.
-        self._scenario = BranchScenario(self)
-        self._scenario.__enter__()
-        self._apply_persisted_overrides(self._scenario)
+        # Create a scenario for this entry and replay persisted overrides.
+        scenario = BranchScenario(self)
+        scenario.__enter__()
+        self._scenarios.append(scenario)
+        self._apply_persisted_overrides(scenario)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
-        assert self._scenario is not None
-        self._scenario.__exit__(exc_type, exc_val, exc_tb)
-        self._scenario = None
+        if not self._scenarios:
+            raise ScenarioError("Branch exited without a matching entry")
+        self._scenarios.pop().__exit__(exc_type, exc_val, exc_tb)
         return False
 
     def override(self, obj: Model, method_name: str, value: Any, args: Tuple = ()) -> None:
-        """Add an override to this branch."""
-        override = Override(obj=obj, method_name=method_name, value=value, args=args)
-        self._overrides[(id(obj), method_name, args)] = override
+        """Add an override to this branch.
 
-        # Also apply to the active scenario for this branch if it is entered.
-        accessor = getattr(obj, method_name)
-        if isinstance(accessor, ComputedFunctionAccessor):
-            node = self._dag.get_or_create_node(
-                obj=obj,
-                method_name=method_name,
-                func=accessor._descriptor.func,
-                flags=accessor._descriptor.flags,
-                args=args,
-            )
-            if self._dag.current_context is self._scenario:
-                assert self._scenario is not None
-                self._scenario.add_tweak(node, value)
+        The target must be a computed function with the Overridable flag,
+        mirroring ``accessor.override()``. Overrides recorded before the
+        branch is entered are applied on entry.
+        """
+        accessor = _overridable_accessor(obj, method_name)
+        self._overrides[(id(obj), method_name, args)] = Override(
+            obj=obj, method_name=method_name, value=value, args=args
+        )
+
+        # Also apply immediately when this branch's scenario is active.
+        if self._scenarios and self._dag.current_context is self._scenarios[-1]:
+            self._scenarios[-1].add_tweak(accessor._get_or_create_node(args), value)
 
     def _remember_override(self, node, value: Any) -> None:
         """Persist an override made while this branch is active."""
@@ -144,18 +159,17 @@ class Branch:
         yield from self._overrides.values()
 
     def _apply_persisted_overrides(self, ctx: Scenario) -> None:
-        """Replay the branch's persisted overrides into the active scenario."""
+        """Replay the branch's persisted overrides into the active scenario.
+
+        Flag validation happened when each override was recorded, so the
+        replay is lenient: entries that no longer resolve to a computed
+        function are skipped. Nodes are resolved through the accessor so they
+        are created with the descriptor's parsed static dependencies.
+        """
         for override in self._iter_overrides():
-            accessor = getattr(override.obj, override.method_name)
+            accessor = getattr(override.obj, override.method_name, None)
             if isinstance(accessor, ComputedFunctionAccessor):
-                node = self._dag.get_or_create_node(
-                    obj=override.obj,
-                    method_name=override.method_name,
-                    func=accessor._descriptor.func,
-                    flags=accessor._descriptor.flags,
-                    args=override.args,
-                )
-                ctx.add_tweak(node, override.value)
+                ctx.add_tweak(accessor._get_or_create_node(override.args), override.value)
 
     @property
     def branch_id(self) -> int:
@@ -210,7 +224,9 @@ def get_overrides() -> OverrideSet:
     if ctx is None:
         return override_set
 
-    for node, _old_value in ctx._tweaks:
+    # A node overridden several times appears once with its current value.
+    unique_nodes = {node.key: node for node, _old_value in ctx._tweaks}
+    for node in unique_nodes.values():
         obj = node.obj_ref()
         if obj is not None:
             override_set.add(

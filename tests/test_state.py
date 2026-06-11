@@ -386,3 +386,201 @@ class TestPersisted:
 
         obj.Value = "changed"
         assert obj.Value() == "changed"
+
+
+class TestClearValue:
+    """Regression tests for clearValue invalidation (audit 2026-06 #1)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_clear_value_before_first_evaluation_invalidates_dependents(self):
+        """A node set before it was ever evaluated never becomes VALID, but its
+        dependents still consume the set value. clearValue must invalidate them."""
+
+        class Option(dag.Model):
+            @dag.computed(dag.Input)
+            def Strike(self):
+                return 1.0
+
+            @dag.computed
+            def Price(self):
+                return self.Strike() * 2
+
+        opt = Option()
+        opt.Strike.set(5.0)        # set BEFORE first evaluation
+        assert opt.Price() == 10.0
+
+        opt.Strike.clearValue()
+        assert opt.Strike() == 1.0
+        assert opt.Price() == 2.0  # must not be stale 10.0
+
+    def test_clear_value_after_evaluation_invalidates_dependents(self):
+        """Control: clearValue after the node has been VALID also works."""
+
+        class Option(dag.Model):
+            @dag.computed(dag.Input)
+            def Strike(self):
+                return 1.0
+
+            @dag.computed
+            def Price(self):
+                return self.Strike() * 2
+
+        opt = Option()
+        assert opt.Price() == 2.0  # Strike evaluated -> VALID
+        opt.Strike.set(5.0)
+        assert opt.Price() == 10.0
+        opt.Strike.clearValue()
+        assert opt.Price() == 2.0
+
+
+class TestBranchReentry:
+    """Regression tests for Branch re-entrancy (audit 2026-06 #2)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _model(self):
+        class Option(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Strike(self):
+                return 1.0
+
+            @dag.computed
+            def Price(self):
+                return self.Strike() * 2
+
+        return Option()
+
+    def test_branch_nested_reentry(self):
+        """The nested re-entry pattern documented in CLAUDE.md must work."""
+        opt = self._model()
+
+        with dag.branch() as b1:
+            opt.Strike.override(1.4)
+            with b1:
+                assert opt.Price() == 2.8
+
+        assert opt.Price() == 2.0
+
+    def test_branch_nested_reentry_releases_scenario_ownership(self):
+        """After nested branch use, the DAG must not stay locked to one thread."""
+        opt = self._model()
+
+        with dag.branch() as b1:
+            opt.Strike.override(1.4)
+            with b1:
+                opt.Price()
+
+        mgr = dag.DagManager.get_instance()
+        assert mgr._scenario_owner is None
+        assert mgr.current_context is None
+
+    def test_branch_override_before_entry(self):
+        """Branch.override() before the branch is first entered must not crash;
+        the override applies when the branch is entered."""
+        opt = self._model()
+
+        b = dag.Branch()
+        b.override(opt, "Strike", 1.5)
+        with b:
+            assert opt.Price() == 3.0
+        assert opt.Price() == 2.0
+
+    def test_branch_exit_without_enter_raises(self):
+        b = dag.Branch()
+        with pytest.raises(dag.ScenarioError):
+            b.__exit__(None, None, None)
+
+
+class TestOverridePathsPreserveStaticDeps:
+    """Nodes created via override plumbing must carry the descriptor's parsed
+    static dependencies (audit 2026-06 #3)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _model(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return self.Base() + 1
+
+            @dag.computed
+            def Base(self):
+                return 10.0
+
+        return Market()
+
+    def test_override_set_apply_preserves_static_deps(self):
+        m = self._model()
+        ovs = dag.OverrideSet()
+        ovs.add(m, "Spot", 99.0)
+
+        with dag.apply_overrides(ovs):
+            assert m.Spot() == 99.0
+
+        # Spot's node was first created via OverrideSet.apply; evaluating it
+        # normally must not raise UntrackedError for its real self-deps.
+        assert m.Spot() == 11.0
+
+    def test_branch_override_preserves_static_deps(self):
+        m = self._model()
+        b = dag.Branch()
+        with b:
+            b.override(m, "Spot", 99.0)
+            assert m.Spot() == 99.0
+        assert m.Spot() == 11.0
+
+
+class TestOverrideFlagEnforcement:
+    """Branch.override and OverrideSet.apply must enforce the Overridable flag
+    like accessor.override() does (audit 2026-06 #5)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _model(self):
+        class Fixed(dag.Model):
+            @dag.computed  # NOT Overridable
+            def Value(self):
+                return 42.0
+
+        return Fixed()
+
+    def test_branch_override_requires_overridable_flag(self):
+        m = self._model()
+        b = dag.Branch()
+        with pytest.raises(dag.OverrideError):
+            b.override(m, "Value", 0.0)
+
+    def test_override_set_apply_requires_overridable_flag(self):
+        m = self._model()
+        ovs = dag.OverrideSet()
+        ovs.add(m, "Value", 0.0)
+        with pytest.raises(dag.OverrideError):
+            with dag.apply_overrides(ovs):
+                pass
+
+
+class TestGetOverridesDedup:
+    """get_overrides() must not duplicate re-overridden nodes (audit 2026-06 #8)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_reoverridden_node_reported_once(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+        m = Market()
+        with dag.scenario():
+            m.Spot.override(1.0)
+            m.Spot.override(2.0)
+            ovs = dag.get_overrides()
+
+        assert len(ovs.overrides) == 1
+        assert ovs.overrides[0].value == 2.0

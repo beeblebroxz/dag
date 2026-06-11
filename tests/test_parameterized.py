@@ -264,3 +264,81 @@ class TestParameterizedSet:
         obj = Settable()
         obj.Value.set(10)
         assert obj.Value() == 10
+
+
+class TestParameterizedMutators:
+    """set/override/watch/clearValue on parameterized cells must target the
+    node for the given args instead of silently using the ()-node
+    (audit 2026-06 #6)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _model(self):
+        class Curve(dag.Model):
+            @dag.computed(dag.Input | dag.Overridable)
+            def Rate(self, tenor):
+                return 0.05
+
+        return Curve()
+
+    def test_set_with_args(self):
+        c = self._model()
+        assert c.Rate('1Y') == 0.05
+
+        c.Rate.set(0.10, '1Y')
+        assert c.Rate('1Y') == 0.10
+        assert c.Rate('2Y') == 0.05  # other parameterizations untouched
+
+    def test_set_missing_required_args_raises(self):
+        c = self._model()
+        with pytest.raises(TypeError):
+            c.Rate.set(0.10)  # Rate requires a tenor
+
+    def test_override_with_args(self):
+        c = self._model()
+        assert c.Rate('1Y') == 0.05
+
+        with dag.scenario():
+            c.Rate.override(0.20, '1Y')
+            assert c.Rate('1Y') == 0.20
+            assert c.Rate('2Y') == 0.05
+
+        assert c.Rate('1Y') == 0.05
+
+    def test_clear_value_with_args(self):
+        c = self._model()
+        c.Rate.set(0.10, '1Y')
+        assert c.Rate('1Y') == 0.10
+
+        c.Rate.clearValue('1Y')
+        assert c.Rate('1Y') == 0.05
+
+    def test_watch_with_args(self):
+        c = self._model()
+        events = []
+
+        def on_rate(node):
+            events.append(c.Rate('1Y'))
+
+        c.Rate.watch(on_rate, '1Y')
+        c.Rate('1Y')  # prime
+        c.Rate.set(0.10, '1Y')
+        dag.flush()
+        assert events == [0.10]
+
+    def test_set_invalidates_dependents_of_parameterized_node(self):
+        class Curve(dag.Model):
+            @dag.computed(dag.Input)
+            def Rate(self, tenor):
+                return 0.05
+
+            @dag.computed
+            def OneYearDF(self):
+                return 1.0 / (1.0 + self.Rate('1Y'))
+
+        c = Curve()
+        assert c.OneYearDF() == 1.0 / 1.05
+
+        c.Rate.set(0.10, '1Y')
+        assert c.OneYearDF() == 1.0 / 1.10

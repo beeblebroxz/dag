@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import functools
+import inspect
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -42,7 +43,7 @@ from typing import (
 
 from .core import DagManager, Node
 from .exceptions import SetValueError, OverrideError
-from .flags import NO_VALUE, Input, Overridable, Flags
+from .flags import Input, Overridable, Flags
 from .parser import parse_dependencies
 
 if TYPE_CHECKING:
@@ -74,6 +75,13 @@ class ComputedFunctionDescriptor:
         self.inverse = inverse
         self.static_deps = static_deps
         self.name = func.__name__
+        try:
+            # Used to validate the args passed to set/override/watch against
+            # the function's parameters. None when unavailable (validation is
+            # then skipped, mirroring how unparseable source is handled).
+            self.signature: Optional[inspect.Signature] = inspect.signature(func)
+        except (ValueError, TypeError):
+            self.signature = None
 
         # Copy function metadata
         functools.update_wrapper(cast(Any, self), func)
@@ -134,40 +142,46 @@ class ComputedFunctionAccessor:
         # Evaluate
         return self._dag.evaluate(node, args)
 
-    def set(self, value: Any) -> None:
+    def set(self, value: Any, *args: Any) -> None:
         """
         Permanently set the value of this computed function.
 
-        The computed function must have the Input flag.
+        The computed function must have the Input flag. For parameterized
+        computed functions, pass the same arguments used to call the
+        function: ``obj.Rate.set(0.10, '1Y')`` targets the
+        ``obj.Rate('1Y')`` node.
         """
         if not (self._descriptor.flags & Input):
             raise SetValueError(self._descriptor.name)
-        self._dag._check_scenario_owner()
+        self._validate_args(args)
 
         # Handle inverse if configured
         if self._descriptor.inverse is not None:
+            if args:
+                raise TypeError(
+                    f"'{self._descriptor.name}' routes set() through an inverse "
+                    "handler and does not support parameterized set"
+                )
             changes = self._descriptor.inverse(self._obj, value)
             # Apply the NodeChange operations returned by the inverse
             self._apply_inverse_changes(changes)
             return
 
-        # Direct set
-        node = self._get_or_create_node()
-        node._set_value = value
-        # Invalidate dependents (not this node, since it now has a set value)
-        self._dag.invalidate_dependents(node)
-        # Notify watchers of this node itself (it changed).
-        self._dag._queue_subscription(node.key)
+        node = self._get_or_create_node(args)
+        self._dag.set_node_value(node, value)
 
-    def override(self, value: Any) -> None:
+    def override(self, value: Any, *args: Any) -> None:
         """
         Temporarily override the value of this computed function.
 
         The computed function must have the Overridable flag.
-        Must be called within a dag.scenario().
+        Must be called within a dag.scenario(). For parameterized computed
+        functions, pass the same arguments used to call the function:
+        ``obj.Rate.override(0.10, '1Y')`` targets the ``obj.Rate('1Y')`` node.
         """
         if not (self._descriptor.flags & Overridable):
             raise OverrideError(self._descriptor.name)
+        self._validate_args(args)
 
         ctx = self._dag.current_context
         if ctx is None:
@@ -180,37 +194,63 @@ class ComputedFunctionAccessor:
         # dependencies). Apply those as temporary tweaks so they revert with
         # the scenario, mirroring how set() routes through the inverse.
         if self._descriptor.inverse is not None:
+            if args:
+                raise TypeError(
+                    f"'{self._descriptor.name}' routes override() through an "
+                    "inverse handler and does not support parameterized override"
+                )
             changes = self._descriptor.inverse(self._obj, value)
             self._apply_inverse_overrides(changes, ctx)
             return
 
-        node = self._get_or_create_node()
+        node = self._get_or_create_node(args)
         ctx.add_tweak(node, value)
 
-    def watch(self, callback: Callable[[Node], None]) -> None:
+    def watch(self, callback: Callable[[Node], None], *args: Any) -> None:
         """
         Watch for notifications when this computed function is invalidated.
 
         The callback receives the Node object and is called when
         dag.flush() is invoked after the node
-        transitions from valid to invalid.
+        transitions from valid to invalid. For parameterized computed
+        functions, pass the invocation arguments to watch that node:
+        ``obj.Rate.watch(callback, '1Y')``.
         """
-        node = self._get_or_create_node()
+        self._validate_args(args)
+        node = self._get_or_create_node(args)
         self._dag.subscribe(node.key, callback)
 
-    def clearValue(self) -> None:
+    def clearValue(self, *args: Any) -> None:
         """Clear any set value, reverting to computed value."""
         if not (self._descriptor.flags & Input):
             raise SetValueError(self._descriptor.name)
-        self._dag._check_scenario_owner()
+        self._validate_args(args)
 
-        node = self._get_or_create_node()
-        node._set_value = NO_VALUE
-        self._dag.invalidate_node(node)
+        node = self._get_or_create_node(args)
+        self._dag.clear_node_value(node)
 
-    def clear_value(self) -> None:
+    def clear_value(self, *args: Any) -> None:
         """Pythonic alias for clearValue()."""
-        self.clearValue()
+        self.clearValue(*args)
+
+    def _validate_args(self, args: Tuple[Any, ...]) -> None:
+        """Reject argument lists no invocation of this function could produce.
+
+        Without this, set/override/watch on a parameterized cell would
+        silently target the ``()``-node, which no call ever reads.
+        """
+        signature = self._descriptor.signature
+        if signature is None:
+            return
+        try:
+            signature.bind(self._obj, *args)
+        except TypeError as exc:
+            raise TypeError(
+                f"Arguments {args!r} do not match the signature of "
+                f"'{self._descriptor.name}': {exc}. Pass the same arguments "
+                "used when calling the computed function, e.g. "
+                f"obj.{self._descriptor.name}.set(value, *args)."
+            ) from None
 
     def _get_or_create_node(self, args: Tuple = ()) -> Node:
         """Get or create the node for this computed function."""
@@ -224,37 +264,63 @@ class ComputedFunctionAccessor:
         )
 
     def _apply_inverse_changes(self, changes: Any) -> None:
-        """Apply NodeChange operations from an inverse handler."""
-        # NodeChange is a tuple of (node_accessor, new_value)
-        # This allows mutual dependencies to be expressed
-        if changes is None:
-            return
+        """Apply changes from an inverse handler permanently (the set() path).
 
-        if not isinstance(changes, (list, tuple)):
-            changes = [changes]
-
-        for change in changes:
+        Accepts NodeChange instances (or anything with .apply()) and
+        (node_getter, value) tuples. Anything else raises rather than being
+        silently dropped.
+        """
+        for change in self._iter_inverse_changes(changes, SetValueError):
             if hasattr(change, 'apply'):
                 change.apply()
-            elif isinstance(change, tuple) and len(change) >= 2:
-                # (node_getter, value) format
-                node_accessor, value = change[0], change[1]
-                if callable(node_accessor):
-                    node_accessor().set(value)
+            else:
+                node_getter, value = change[0], change[1]
+                node_getter().set(value)
 
     def _apply_inverse_overrides(self, changes: Any, ctx: Any) -> None:
-        """Apply NodeChange operations from an inverse handler as temporary
-        scenario tweaks (the override counterpart of _apply_inverse_changes)."""
-        if changes is None:
-            return
-
-        if not isinstance(changes, (list, tuple)):
-            changes = [changes]
-
-        for change in changes:
+        """Apply changes from an inverse handler as temporary scenario tweaks
+        (the override counterpart of _apply_inverse_changes; accepts the same
+        change formats)."""
+        for change in self._iter_inverse_changes(changes, OverrideError):
             if isinstance(change, NodeChange):
                 node = change.node_accessor._get_or_create_node()
                 ctx.add_tweak(node, change.value)
+            elif hasattr(change, 'apply'):
+                raise OverrideError(
+                    self._descriptor.name,
+                    f"Inverse handler for '{self._descriptor.name}' returned "
+                    f"{change!r}, which cannot be applied as a temporary "
+                    "override (only NodeChange and (node_getter, value) "
+                    "tuples can)."
+                )
+            else:
+                node_getter, value = change[0], change[1]
+                node = node_getter()._get_or_create_node()
+                ctx.add_tweak(node, value)
+
+    def _iter_inverse_changes(self, changes: Any, error_cls: type) -> list:
+        """Normalize an inverse handler's return value to a list of supported
+        changes, raising error_cls on unsupported entries."""
+        if changes is None:
+            return []
+
+        if not isinstance(changes, (list, tuple)):
+            changes = [changes]
+
+        for change in changes:
+            is_tuple_change = (
+                isinstance(change, tuple)
+                and len(change) >= 2
+                and callable(change[0])
+            )
+            if not is_tuple_change and not hasattr(change, 'apply'):
+                raise error_cls(
+                    self._descriptor.name,
+                    f"Inverse handler for '{self._descriptor.name}' returned "
+                    f"an unsupported change: {change!r}"
+                )
+
+        return list(changes)
 
     @property
     def _node(self) -> Optional[Node]:
@@ -331,9 +397,10 @@ class NodeChange:
         self.value = value
 
     def apply(self) -> None:
-        """Apply this change."""
-        self.node_accessor._dag._check_scenario_owner()
-        # Get the node and set its value directly (bypassing inverse)
+        """Apply this change permanently, with the same checks and
+        invalidation/notification semantics as set()."""
+        descriptor = self.node_accessor._descriptor
+        if not (descriptor.flags & Input):
+            raise SetValueError(descriptor.name)
         node = self.node_accessor._get_or_create_node()
-        node._set_value = self.value
-        self.node_accessor._dag.invalidate_node(node)
+        self.node_accessor._dag.set_node_value(node, self.value)

@@ -551,6 +551,35 @@ class DagManager:
             if output_node is not None:
                 self.invalidate_node(output_node)
 
+    def set_node_value(self, node: Node, value: Any) -> None:
+        """Permanently set a node's value, invalidating dependents and
+        notifying the node's own watchers.
+
+        Single choke point for every permanent-write path (``accessor.set``
+        and ``NodeChange.apply``), so their invalidation and notification
+        semantics cannot drift apart.
+        """
+        self._check_scenario_owner()
+        node._set_value = value
+        self.invalidate_dependents(node)
+        self._queue_subscription(node.key)
+
+    def clear_node_value(self, node: Node) -> None:
+        """Clear a node's permanent set value, reverting it to its computed
+        value.
+
+        Dependents are invalidated explicitly rather than via
+        ``invalidate_node``: a node that was set before ever being evaluated
+        is still INVALID (``evaluate`` serves the set value without validating
+        the node), so ``invalidate_node``'s already-invalid short-circuit
+        would skip dependents that consumed the set value.
+        """
+        self._check_scenario_owner()
+        node._set_value = NO_VALUE
+        node.invalidate()
+        self.invalidate_dependents(node)
+        self._queue_subscription(node.key)
+
     def add_dependency(self, from_node: Node, to_node: Node) -> None:
         """Add a dependency edge: from_node depends on to_node."""
         from_node.inputs.add(to_node.key)
@@ -695,6 +724,8 @@ class Scenario:
                 if old_value is NO_VALUE:
                     # Also invalidate this node since we're reverting to computed value
                     node.invalidate()
+                # The reverted node changed too: notify its own watchers.
+                self._dag._queue_subscription(node.key)
         finally:
             self._dag.pop_context()
             self._dag._release_scenario_ownership()
@@ -709,6 +740,9 @@ class Scenario:
         # Must invalidate dependents even if this node is already invalid
         # (e.g., when node has a set_value but state is INVALID)
         self._dag.invalidate_dependents(node)
+        # The overridden node itself changed: notify its own watchers,
+        # mirroring how set() notifies the node it sets.
+        self._dag._queue_subscription(node.key)
 
     @property
     def layer_id(self) -> int:

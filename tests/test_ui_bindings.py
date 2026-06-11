@@ -520,3 +520,36 @@ class TestIntegration:
         label._binding._update_widget()
 
         assert label.cget('text') == "400"
+
+
+class TestFormatterEdgeCases:
+    """default_formatter must handle non-finite floats (audit 2026-06)."""
+
+    def test_default_formatter_nan(self):
+        assert default_formatter(float('nan')) == 'nan'
+
+    def test_default_formatter_inf(self):
+        assert default_formatter(float('inf')) == 'inf'
+        assert default_formatter(float('-inf')) == '-inf'
+
+
+class TestBindingDestroy:
+    """Binding.destroy() must unsubscribe from the DAG (audit 2026-06)."""
+
+    def test_destroy_unsubscribes_output_binding(self, dag_app):
+        class Calc(dag.Model):
+            @dag.computed(dag.Input)
+            def Value(self):
+                return 1.0
+
+        calc = Calc()
+        label = tk.Label(dag_app.root)
+        binding = dag_app.bind_output(calc.Value, label)
+
+        node = calc.Value._node
+        mgr = dag.DagManager.get_instance()
+        assert mgr._subscriptions.get(node.key), "binding should be subscribed"
+
+        binding.destroy()
+        assert not mgr._subscriptions.get(node.key), \
+            "destroy() must remove the subscription"

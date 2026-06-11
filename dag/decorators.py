@@ -220,6 +220,26 @@ class ComputedFunctionAccessor:
         node = self._get_or_create_node(args)
         self._dag.subscribe(node.key, callback)
 
+    def unwatch(self, callback: Callable[[Node], None], *args: Any) -> None:
+        """Remove a callback registered with watch() for the same args."""
+        self._validate_args(args)
+        node = self._get_or_create_node(args)
+        self._dag.unsubscribe(node.key, callback)
+
+    def invalidate(self, *args: Any) -> None:
+        """Force this computed function to recompute on next evaluation.
+
+        Invalidates the node and its dependents and queues watch
+        notifications. This is the explicit refresh hook for cells whose
+        body is not perfectly pure — e.g. re-reading external data, or
+        retrying an Optional cell that cached NO_VALUE after a transient
+        failure.
+        """
+        self._validate_args(args)
+        self._dag._check_scenario_owner()
+        node = self._get_or_create_node(args)
+        self._dag.invalidate_node(node)
+
     def clearValue(self, *args: Any) -> None:
         """Clear any set value, reverting to computed value."""
         if not (self._descriptor.flags & Input):

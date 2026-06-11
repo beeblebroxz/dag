@@ -233,3 +233,56 @@ class TestErrorHandling:
         obj = Suppressable()
         result = obj.MayFail()
         assert result is dag.NO_VALUE
+
+
+class TestFilterNodes:
+    """filter_nodes must walk the graph under root_accessor, not scan every
+    node globally (audit 2026-06)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_filter_nodes_scopes_to_root_graph(self):
+        env_holder = {}
+
+        class Env(dag.Model):
+            @dag.computed(dag.Input)
+            def Rate(self):
+                return 0.01
+
+        class Opt(dag.Model):
+            @dag.computed(dag.Input)
+            def Strike(self):
+                return 1.0
+
+            @dag.computed
+            def Price(self):
+                return self.Strike() * (1 + env_holder['env'].Rate())
+
+        env_holder['env'] = Env()
+        opt = Opt()
+        other = Opt()
+
+        opt.Price()     # build runtime graph edges under opt.Price
+        other.Strike()  # a settable node outside opt.Price's graph
+
+        opt_nodes = dag.filter_nodes(Opt, opt.Price)
+        found = {(node.key.obj_id, node.method_name) for node in opt_nodes}
+        assert (id(opt), 'Strike') in found
+        assert (id(other), 'Strike') not in found
+
+        env_nodes = dag.filter_nodes(Env, opt.Price)
+        assert {node.method_name for node in env_nodes} == {'Rate'}
+
+    def test_filter_nodes_unevaluated_root_returns_empty(self):
+        class Opt(dag.Model):
+            @dag.computed(dag.Input)
+            def Strike(self):
+                return 1.0
+
+            @dag.computed
+            def Price(self):
+                return self.Strike()
+
+        opt = Opt()
+        assert dag.filter_nodes(Opt, opt.Price) == []

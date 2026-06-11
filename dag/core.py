@@ -10,6 +10,7 @@ The DAG tracks dependencies between computed functions and manages:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import weakref
@@ -95,9 +96,6 @@ class Node:
     inputs: Set[NodeKey] = field(default_factory=set)
     # Runtime output edges (nodes that depend on us)
     outputs: Set[NodeKey] = field(default_factory=set)
-
-    # Branch tracking (which branches have overrides for this node)
-    layer_set: Set[int] = field(default_factory=set)
 
     # Set/override value (if applicable)
     _set_value: Any = field(default=NO_VALUE, repr=False)
@@ -201,6 +199,10 @@ class DagManager:
         self._scenario_owner: Optional[int] = None
         self._scenario_depth: int = 0
         self._scenario_lock = threading.Lock()
+        # Wait-for graph for cross-thread deadlock detection:
+        # thread id -> key of the node that thread is blocked waiting on.
+        self._threads_waiting: Dict[int, NodeKey] = {}
+        self._waiting_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> DagManager:
@@ -451,7 +453,15 @@ class DagManager:
                     node.state == NodeState.EVALUATING
                     and node._evaluating_thread_id != current_thread_id
                 ):
-                    node._condition.wait()
+                    # Registering the wait detects wait-for cycles (thread A
+                    # waiting on a node evaluated by thread B that is waiting
+                    # on a node evaluated by A) and raises CycleError instead
+                    # of deadlocking.
+                    self._register_wait(current_thread_id, node)
+                    try:
+                        node._condition.wait()
+                    finally:
+                        self._unregister_wait(current_thread_id)
                     continue
 
                 node._state = NodeState.EVALUATING
@@ -612,6 +622,39 @@ class DagManager:
                 if self._scenario_depth == 0:
                     self._scenario_owner = None
 
+    def _register_wait(self, thread_id: int, node: Node) -> None:
+        """Record that thread_id is about to block waiting for node.
+
+        Walks the wait-for chain (node's evaluator -> the node that thread
+        waits on -> its evaluator -> ...) under one lock; check and
+        registration are atomic, so for any two threads about to deadlock,
+        whichever registers second sees the other and raises CycleError.
+        """
+        with self._waiting_lock:
+            evaluator = node._evaluating_thread_id
+            while evaluator is not None:
+                if evaluator == thread_id:
+                    raise CycleError(
+                        f"Cross-thread cyclic dependency detected while "
+                        f"waiting for '{node.method_name}': the threads "
+                        "evaluating these nodes are waiting on each other."
+                    )
+                waited_key = self._threads_waiting.get(evaluator)
+                if waited_key is None:
+                    break
+                waited_node = self.get_node(waited_key)
+                evaluator = (
+                    waited_node._evaluating_thread_id
+                    if waited_node is not None
+                    else None
+                )
+            self._threads_waiting[thread_id] = node.key
+
+    def _unregister_wait(self, thread_id: int) -> None:
+        """Remove thread_id from the wait-for graph after it wakes."""
+        with self._waiting_lock:
+            self._threads_waiting.pop(thread_id, None)
+
     def _check_scenario_owner(self) -> None:
         """Reject DAG access from a thread other than the active scenario owner."""
         owner = self._scenario_owner  # lock-free single-attribute read (GIL-atomic)
@@ -648,11 +691,39 @@ class DagManager:
 
     # Subscriptions
     def subscribe(self, node_key: NodeKey, callback: Callable) -> None:
-        """Subscribe to notifications when a node is invalidated."""
+        """Subscribe to notifications when a node is invalidated.
+
+        Callbacks are weakly held: a callback dies with its owner. Bound
+        methods are held via ``weakref.WeakMethod`` (a plain ``weakref.ref``
+        would die immediately, since each ``obj.method`` access creates a
+        transient bound-method object).
+        """
+        ref: weakref.ref
+        if inspect.ismethod(callback):
+            ref = weakref.WeakMethod(callback)
+        else:
+            ref = weakref.ref(callback)
         with self._subscriptions_lock:
             if node_key not in self._subscriptions:
                 self._subscriptions[node_key] = []
-            self._subscriptions[node_key].append(weakref.ref(callback))
+            self._subscriptions[node_key].append(ref)
+
+    def unsubscribe(self, node_key: NodeKey, callback: Callable) -> None:
+        """Remove a previously subscribed callback (matched by equality, so a
+        fresh bound-method object identifies its registration)."""
+        with self._subscriptions_lock:
+            refs = self._subscriptions.get(node_key)
+            if not refs:
+                return
+            kept = [
+                ref for ref in refs
+                if ref() is not None and ref() != callback
+            ]
+            if kept:
+                self._subscriptions[node_key] = kept
+            else:
+                self._subscriptions.pop(node_key, None)
+                self._pending_notifications.discard(node_key)
 
     def _queue_subscription(self, node_key: NodeKey) -> None:
         """Enqueue a pending notification for a watched node (dispatched on flush)."""

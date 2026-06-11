@@ -435,3 +435,163 @@ class TestWatchOnChangedNodeItself:
         NodeChange(m.Spot, 120.0).apply()  # node never evaluated before
         dag.flush()
         assert events == [120.0]
+
+
+class TestWatchCallbackLifecycle:
+    """watch() must hold bound methods via WeakMethod: alive while their owner
+    lives, dead when it dies, and removable via unwatch() (audit 2026-06)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def _market(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Input)
+            def Spot(self):
+                return 100.0
+
+        return Market()
+
+    def test_bound_method_callback_survives_without_strong_ref(self):
+        import gc
+
+        class Listener:
+            def __init__(self):
+                self.events = []
+
+            def on_change(self, node):
+                self.events.append(node.method_name)
+
+        m = self._market()
+        listener = Listener()
+        m.Spot.watch(listener.on_change)  # no strong ref kept to the bound method
+        gc.collect()
+
+        m.Spot.set(120.0)
+        dag.flush()
+        assert listener.events == ['Spot']
+
+    def test_bound_method_callback_dies_with_its_owner(self):
+        import gc
+
+        events = []
+
+        class Listener:
+            def on_change(self, node):
+                events.append(node.method_name)
+
+        m = self._market()
+        listener = Listener()
+        m.Spot.watch(listener.on_change)
+        del listener
+        gc.collect()
+
+        m.Spot.set(120.0)
+        dag.flush()
+        assert events == []
+
+    def test_unwatch_removes_function_callback(self):
+        events = []
+
+        def on_change(node):
+            events.append(node.method_name)
+
+        m = self._market()
+        m.Spot.watch(on_change)
+        m.Spot.set(110.0)
+        dag.flush()
+        assert events == ['Spot']
+
+        m.Spot.unwatch(on_change)
+        m.Spot.set(120.0)
+        dag.flush()
+        assert events == ['Spot']  # no further notifications
+
+    def test_unwatch_removes_bound_method_callback(self):
+        class Listener:
+            def __init__(self):
+                self.events = []
+
+            def on_change(self, node):
+                self.events.append(node.method_name)
+
+        m = self._market()
+        listener = Listener()
+        m.Spot.watch(listener.on_change)
+        m.Spot.set(110.0)
+        dag.flush()
+        assert listener.events == ['Spot']
+
+        # A fresh bound-method object must compare equal to the registered one.
+        m.Spot.unwatch(listener.on_change)
+        m.Spot.set(120.0)
+        dag.flush()
+        assert listener.events == ['Spot']
+
+
+class TestExplicitInvalidate:
+    """accessor.invalidate() forces recompute and notifies dependents and
+    watchers — the refresh/retry hook for impure or Optional cells."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_invalidate_forces_recompute(self):
+        calls = {'n': 0}
+
+        class Feed(dag.Model):
+            @dag.computed
+            def Data(self):
+                calls['n'] += 1
+                return calls['n']
+
+        f = Feed()
+        assert f.Data() == 1
+        assert f.Data() == 1  # cached
+
+        f.Data.invalidate()
+        assert f.Data() == 2  # recomputed
+
+    def test_invalidate_notifies_dependents_and_watchers(self):
+        calls = {'n': 0}
+
+        class Feed(dag.Model):
+            @dag.computed
+            def Data(self):
+                calls['n'] += 1
+                return calls['n']
+
+            @dag.computed
+            def Doubled(self):
+                return self.Data() * 2
+
+        f = Feed()
+        events = []
+
+        def on_doubled(node):
+            events.append(f.Doubled())
+
+        f.Doubled.watch(on_doubled)
+        assert f.Doubled() == 2
+
+        f.Data.invalidate()
+        dag.flush()
+        assert events == [4]  # dependent recomputed from fresh Data
+
+    def test_invalidate_rearms_optional_cell_after_failure(self):
+        attempts = {'n': 0}
+
+        class Feed(dag.Model):
+            @dag.computed(dag.Optional)
+            def Data(self):
+                attempts['n'] += 1
+                if attempts['n'] == 1:
+                    raise IOError("transient failure")
+                return 42.0
+
+        f = Feed()
+        assert f.Data() is dag.NO_VALUE   # first attempt fails, cached
+        assert f.Data() is dag.NO_VALUE   # still cached, no retry
+
+        f.Data.invalidate()               # explicit retry hook
+        assert f.Data() == 42.0

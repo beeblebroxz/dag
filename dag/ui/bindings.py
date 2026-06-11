@@ -9,6 +9,7 @@ This module provides three types of bindings:
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -29,8 +30,8 @@ def default_formatter(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, float):
-        # Format floats nicely
-        if value == int(value):
+        # Format floats nicely (isfinite guards int() against NaN/inf)
+        if math.isfinite(value) and value == int(value):
             return str(int(value))
         return f"{value:.6g}"
     return str(value)
@@ -82,6 +83,7 @@ class Binding:
         self.on_error = on_error or self._default_error_handler
         self._updating = False  # Prevent feedback loops
         self._original_bg = None  # For error highlighting
+        self._cell_change_callback: Optional[Callable] = None  # Active watch
 
     def _default_error_handler(self, error: Exception, context: str) -> None:
         """Default error handler: highlight widget and print error."""
@@ -99,9 +101,95 @@ class Binding:
                 self.widget.config(bg=self._original_bg)
             self._original_bg = None
 
+    def _watch_cell(self) -> None:
+        """Subscribe to invalidation of the bound cell.
+
+        The DAG holds bound-method callbacks via WeakMethod, so the
+        subscription lives exactly as long as this binding unless destroy()
+        removes it earlier.
+        """
+        self._cell_change_callback = self._on_cell_change
+        self.cell_accessor.watch(self._cell_change_callback)
+
+    def _on_cell_change(self, node: Node) -> None:
+        """Called when the watched cell is invalidated; schedules a widget
+        refresh on the Tk event loop."""
+        self.widget.after_idle(self._update_widget)
+
+    def _update_widget(self) -> None:
+        """Refresh the widget from the cell (defined by watching bindings)."""
+        raise NotImplementedError
+
     def destroy(self) -> None:
-        """Clean up the binding."""
-        pass  # Subclasses can override
+        """Clean up the binding (removes its DAG subscription)."""
+        if self._cell_change_callback is not None:
+            self.cell_accessor.unwatch(self._cell_change_callback)
+            self._cell_change_callback = None
+
+
+class _InputBindingBase(Binding):
+    """Shared widget -> cell synchronization for bindings that read user
+    input (InputBinding and TwoWayBinding)."""
+
+    update_on: str
+
+    def _bind_events(self) -> None:
+        """Bind widget events for input detection."""
+        if isinstance(self.widget, (tk.Entry, tk.Spinbox)):
+            if self.update_on in ('focusout', 'both'):
+                self.widget.bind('<FocusOut>', self._on_widget_change)
+                self.widget.bind('<Return>', self._on_widget_change)
+            if self.update_on in ('key', 'both'):
+                self.widget.bind('<KeyRelease>', self._on_widget_change)
+            if isinstance(self.widget, tk.Spinbox):
+                # Also bind spinbox buttons
+                self.widget.config(command=self._on_spinbox_change)
+        elif isinstance(self.widget, tk.Scale):
+            self.widget.config(command=self._on_scale_change)
+
+    def _on_widget_change(self, event: Optional[tk.Event] = None) -> None:
+        """Called when the widget value changes."""
+        if self._updating:
+            return
+
+        self._updating = True
+        try:
+            if isinstance(self.widget, (tk.Entry, tk.Spinbox)):
+                text = self.widget.get()
+            elif hasattr(self.widget, 'get'):
+                text = str(self.widget.get())
+            else:
+                return
+
+            value = self.parser(text)
+            self.cell_accessor.set(value)
+            self.app.schedule_update()
+            self._clear_error()
+
+        except Exception as e:
+            self.on_error(e, "parsing input")
+        finally:
+            self._updating = False
+
+    def _on_scale_change(self, value: str) -> None:
+        """Called when a Scale widget changes."""
+        if self._updating:
+            return
+
+        self._updating = True
+        try:
+            parsed_value = self.parser(value)
+            self.cell_accessor.set(parsed_value)
+            self.app.schedule_update()
+            self._clear_error()
+        except Exception as e:
+            self.on_error(e, "parsing scale value")
+        finally:
+            self._updating = False
+
+    def _on_spinbox_change(self) -> None:
+        """Called when Spinbox buttons are clicked."""
+        self._on_widget_change()
 
 
 class OutputBinding(Binding):
@@ -128,20 +216,10 @@ class OutputBinding(Binding):
             on_error=on_error,
         )
 
-        # Keep a strong reference to the callback to prevent garbage collection
-        # (DAG uses weakref for subscriptions)
-        self._cell_change_callback = self._on_cell_change
-
-        # Subscribe to computed function invalidation
-        self.cell_accessor.watch(self._cell_change_callback)
+        self._watch_cell()
 
         # Initial update
         self._update_widget()
-
-    def _on_cell_change(self, node: Node) -> None:
-        """Called when the computed function is invalidated."""
-        # Schedule widget update on the main thread
-        self.widget.after_idle(self._update_widget)
 
     def _update_widget(self) -> None:
         """Update the widget with the current computed value."""
@@ -181,7 +259,7 @@ class OutputBinding(Binding):
             self._updating = False
 
 
-class InputBinding(Binding):
+class InputBinding(_InputBindingBase):
     """
     One-way binding: widget -> computed function.
 
@@ -208,77 +286,8 @@ class InputBinding(Binding):
         self.update_on = update_on
         self._bind_events()
 
-    def _bind_events(self) -> None:
-        """Bind widget events for input detection."""
-        if isinstance(self.widget, tk.Entry):
-            if self.update_on in ('focusout', 'both'):
-                self.widget.bind('<FocusOut>', self._on_widget_change)
-                self.widget.bind('<Return>', self._on_widget_change)
-            if self.update_on in ('key', 'both'):
-                self.widget.bind('<KeyRelease>', self._on_widget_change)
 
-        elif isinstance(self.widget, tk.Scale):
-            self.widget.config(command=self._on_scale_change)
-
-        elif isinstance(self.widget, tk.Spinbox):
-            if self.update_on in ('focusout', 'both'):
-                self.widget.bind('<FocusOut>', self._on_widget_change)
-                self.widget.bind('<Return>', self._on_widget_change)
-            if self.update_on in ('key', 'both'):
-                self.widget.bind('<KeyRelease>', self._on_widget_change)
-            # Also bind spinbox buttons
-            self.widget.config(command=self._on_spinbox_change)
-
-    def _on_widget_change(self, event: Optional[tk.Event] = None) -> None:
-        """Called when the widget value changes."""
-        if self._updating:
-            return
-
-        self._updating = True
-        try:
-            # Get widget value
-            if isinstance(self.widget, tk.Entry):
-                text = self.widget.get()
-            elif isinstance(self.widget, tk.Spinbox):
-                text = self.widget.get()
-            elif hasattr(self.widget, 'get'):
-                text = str(self.widget.get())
-            else:
-                return
-
-            # Parse and set
-            value = self.parser(text)
-            self.cell_accessor.set(value)
-            self.app.schedule_update()
-            self._clear_error()
-
-        except Exception as e:
-            self.on_error(e, "parsing input")
-        finally:
-            self._updating = False
-
-    def _on_scale_change(self, value: str) -> None:
-        """Called when a Scale widget changes."""
-        if self._updating:
-            return
-
-        self._updating = True
-        try:
-            parsed_value = self.parser(value)
-            self.cell_accessor.set(parsed_value)
-            self.app.schedule_update()
-            self._clear_error()
-        except Exception as e:
-            self.on_error(e, "parsing scale value")
-        finally:
-            self._updating = False
-
-    def _on_spinbox_change(self) -> None:
-        """Called when Spinbox buttons are clicked."""
-        self._on_widget_change()
-
-
-class TwoWayBinding(Binding):
+class TwoWayBinding(_InputBindingBase):
     """
     Two-way binding: widget <-> computed function.
 
@@ -307,42 +316,14 @@ class TwoWayBinding(Binding):
         )
         self.update_on = update_on
 
-        # Keep a strong reference to the callback to prevent garbage collection
-        # (DAG uses weakref for subscriptions)
-        self._cell_change_callback = self._on_cell_change
-
         # Subscribe to computed function changes
-        self.cell_accessor.watch(self._cell_change_callback)
+        self._watch_cell()
 
         # Bind widget events
         self._bind_events()
 
         # Initial sync
         self._update_widget()
-
-    def _bind_events(self) -> None:
-        """Bind widget events for input detection."""
-        if isinstance(self.widget, tk.Entry):
-            if self.update_on in ('focusout', 'both'):
-                self.widget.bind('<FocusOut>', self._on_widget_change)
-                self.widget.bind('<Return>', self._on_widget_change)
-            if self.update_on in ('key', 'both'):
-                self.widget.bind('<KeyRelease>', self._on_widget_change)
-
-        elif isinstance(self.widget, tk.Scale):
-            self.widget.config(command=self._on_scale_change)
-
-        elif isinstance(self.widget, tk.Spinbox):
-            if self.update_on in ('focusout', 'both'):
-                self.widget.bind('<FocusOut>', self._on_widget_change)
-                self.widget.bind('<Return>', self._on_widget_change)
-            if self.update_on in ('key', 'both'):
-                self.widget.bind('<KeyRelease>', self._on_widget_change)
-            self.widget.config(command=self._on_spinbox_change)
-
-    def _on_cell_change(self, node: Node) -> None:
-        """Called when the computed function is invalidated."""
-        self.widget.after_idle(self._update_widget)
 
     def _update_widget(self) -> None:
         """Update the widget with the current computed value."""
@@ -380,47 +361,3 @@ class TwoWayBinding(Binding):
             self.on_error(e, "updating widget")
         finally:
             self._updating = False
-
-    def _on_widget_change(self, event: Optional[tk.Event] = None) -> None:
-        """Called when the widget value changes."""
-        if self._updating:
-            return
-
-        self._updating = True
-        try:
-            if isinstance(self.widget, (tk.Entry, tk.Spinbox)):
-                text = self.widget.get()
-            elif hasattr(self.widget, 'get'):
-                text = str(self.widget.get())
-            else:
-                return
-
-            value = self.parser(text)
-            self.cell_accessor.set(value)
-            self.app.schedule_update()
-            self._clear_error()
-
-        except Exception as e:
-            self.on_error(e, "parsing input")
-        finally:
-            self._updating = False
-
-    def _on_scale_change(self, value: str) -> None:
-        """Called when a Scale widget changes."""
-        if self._updating:
-            return
-
-        self._updating = True
-        try:
-            parsed_value = self.parser(value)
-            self.cell_accessor.set(parsed_value)
-            self.app.schedule_update()
-            self._clear_error()
-        except Exception as e:
-            self.on_error(e, "parsing scale value")
-        finally:
-            self._updating = False
-
-    def _on_spinbox_change(self) -> None:
-        """Called when Spinbox buttons are clicked."""
-        self._on_widget_change()

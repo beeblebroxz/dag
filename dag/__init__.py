@@ -57,17 +57,13 @@ from .model import Model, Registry, RegistryMixin
 from .core import Scenario, DagManager, Node, NodeKey, scenario, flush
 from .decorators import ComputedFunctionAccessor, ComputedFunctionDescriptor, NodeChange, computed
 from .exceptions import (
-    ModelError,
-    ConstructorError,
     ScenarioError,
     ConcurrentScenarioError,
     CycleError,
     DagError,
     DependencyError,
     EvaluationError,
-    InvalidationError,
     UntrackedError,
-    ParseError,
     SetValueError,
     OverrideError,
 )
@@ -127,15 +123,11 @@ __all__ = [
     "DependencyError",
     "UntrackedError",
     "CycleError",
-    "InvalidationError",
     "SetValueError",
     "OverrideError",
     "ScenarioError",
     "ConcurrentScenarioError",
     "EvaluationError",
-    "ParseError",
-    "ModelError",
-    "ConstructorError",
 ]
 
 
@@ -171,22 +163,38 @@ def filter_nodes(
     root_accessor: ComputedFunctionAccessor,
 ) -> list:
     """
-    Filter nodes in the DAG by type.
+    Find settable/overridable nodes in the graph under a root computed function.
 
-    Returns all settable/overridable nodes belonging to objects of the
-    given type underneath the graph of root_accessor.
+    Walks the runtime dependency graph reachable from root_accessor's node
+    and returns the nodes that belong to objects of the given type and can
+    be changed (Input or Overridable). The runtime graph only exists after
+    the root has been evaluated; an unevaluated root yields an empty list.
 
     Similar to dag.filter(sandra.cells.MarketInterface, p.Price) from the spec.
     """
-    # Simplified implementation - full version would walk the graph
-    dag = DagManager.get_instance()
-    results = []
+    manager = DagManager.get_instance()
+    root = root_accessor._node
+    if root is None:
+        return []
 
-    for node in dag._nodes.values():
+    results = []
+    seen = {root.key}
+    stack = [root]
+    while stack:
+        node = stack.pop()
         obj = node.obj_ref()
-        if obj is not None and isinstance(obj, model_type):
-            if node.flags & (Input | Overridable):
-                results.append(node)
+        if (
+            obj is not None
+            and isinstance(obj, model_type)
+            and node.flags & (Input | Overridable)
+        ):
+            results.append(node)
+        for input_key in node.inputs:
+            if input_key not in seen:
+                seen.add(input_key)
+                child = manager.get_node(input_key)
+                if child is not None:
+                    stack.append(child)
 
     return results
 

@@ -656,3 +656,55 @@ class TestScenarioThreadGuard:
         finally:
             mgr._release_scenario_ownership()  # owner releases
         assert mgr._scenario_owner is None
+
+
+class TestCrossThreadDeadlock:
+    """Mutually-dependent nodes evaluated from two threads must raise
+    CycleError instead of deadlocking on each other's condition variables
+    (audit 2026-06)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_mutual_dependency_across_threads_raises_instead_of_hanging(self):
+        sync = threading.Barrier(2)
+
+        def synced():
+            try:
+                sync.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
+
+        class Cyclic(dag.Model):
+            @dag.computed
+            def A(self):
+                synced()
+                return self.B() + 1
+
+            @dag.computed
+            def B(self):
+                synced()
+                return self.A() + 1
+
+        m = Cyclic()
+        errors = {}
+
+        def run(name, accessor):
+            try:
+                accessor()
+            except Exception as exc:  # noqa: BLE001 - recording for assertions
+                errors[name] = exc
+
+        t1 = threading.Thread(target=run, args=("A", m.A), daemon=True)
+        t2 = threading.Thread(target=run, args=("B", m.B), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive(), \
+            "threads deadlocked on mutually-dependent nodes"
+        # Both evaluations fail: the dependency really is cyclic.
+        assert set(errors) == {"A", "B"}
+        for exc in errors.values():
+            assert isinstance(exc, (dag.CycleError, dag.EvaluationError))

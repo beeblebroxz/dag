@@ -34,11 +34,6 @@ class CycleError(DagError):
     pass
 
 
-class InvalidationError(DagError):
-    """Raised when there's an issue during invalidation propagation."""
-    pass
-
-
 class SetValueError(DagError):
     """Raised when trying to set a value on a computed function that doesn't support it."""
 
@@ -88,25 +83,3 @@ class EvaluationError(DagError):
         super().__init__(f"Error evaluating '{func_name}': {original_error}")
 
 
-class ParseError(DagError):
-    """Raised when there's an error parsing a computed function for dependencies."""
-
-    def __init__(self, func_name: str, message: str):
-        self.func_name = func_name
-        super().__init__(f"Error parsing '{func_name}': {message}")
-
-
-class ModelError(DagError):
-    """Raised when there's a violation of Model constraints."""
-    pass
-
-
-class ConstructorError(ModelError):
-    """Raised when a Model has an invalid constructor."""
-
-    def __init__(self, class_name: str):
-        self.class_name = class_name
-        super().__init__(
-            f"Model '{class_name}' should not have a constructor with side effects. "
-            "Use default calculated values via computed functions instead."
-        )

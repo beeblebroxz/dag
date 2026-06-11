@@ -2,10 +2,13 @@
 Flag constants for computed function decorators.
 
 These flags control the behavior of computed functions:
-- Serialized: The result will be automatically serialized/persisted
+- Serialized: Marks the result for serialization. Declarative only: the
+  framework does not ship a persistence layer, so this flag currently has
+  no behavioral effect.
 - Input: The value can be permanently set (set)
 - Overridable: The value can be temporarily overridden (override)
-- Persisted: Combination of Input and Serialized
+- Persisted: Combination of Input and Serialized (the Input bit is what
+  makes Persisted cells settable)
 - Optional: Return NO_VALUE instead of raising exceptions
 - CanChange: Indicates the cell can be modified (Input, Overridable, or has inverse)
 """
@@ -17,7 +20,7 @@ class Flags:
     """Bit flags for computed function properties."""
 
     NONE: Final[int] = 0
-    Serialized: Final[int] = 1 << 0    # Result will be serialized
+    Serialized: Final[int] = 1 << 0    # Serialization marker (no built-in persistence)
     Input: Final[int] = 1 << 1         # Can be set permanently
     Overridable: Final[int] = 1 << 2   # Can be temporarily overridden
     Optional: Final[int] = 1 << 3      # Return NO_VALUE instead of raising

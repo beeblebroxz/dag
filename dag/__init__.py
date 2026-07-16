@@ -77,7 +77,15 @@ from .flags import (
     Persisted,
     Optional,
 )
-from .parser import parse_dependencies, parse_dependencies_detailed
+from .parser import (
+    Dependency,
+    DependencyParseResult,
+    DependencyPath,
+    ParseStatus,
+    parse_dependencies,
+    parse_dependencies_detailed,
+    parse_dependency_result,
+)
 from .state import Branch, Override, OverrideSet, apply_overrides, get_overrides, branch, untracked
 
 __version__ = "0.1.0"
@@ -116,8 +124,13 @@ __all__ = [
     "untracked",
     "flush",
     # Parser
+    "Dependency",
+    "DependencyPath",
+    "DependencyParseResult",
+    "ParseStatus",
     "parse_dependencies",
     "parse_dependencies_detailed",
+    "parse_dependency_result",
     # Exceptions
     "DagError",
     "DependencyError",

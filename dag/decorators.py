@@ -44,7 +44,7 @@ from typing import (
 from .core import DagManager, Node
 from .exceptions import SetValueError, OverrideError
 from .flags import Input, Overridable, Flags
-from .parser import parse_dependencies
+from .parser import Dependency, DependencyParseResult, parse_dependency_result
 
 if TYPE_CHECKING:
     from .model import Model
@@ -69,11 +69,18 @@ class ComputedFunctionDescriptor:
         flags: int = Flags.NONE,
         inverse: Optional[Callable] = None,
         static_deps: Optional[FrozenSet[str]] = frozenset(),
+        dependency_parse_result: Optional[DependencyParseResult] = None,
     ):
         self.func = func
         self.flags = flags
         self.inverse = inverse
         self.static_deps = static_deps
+        self.dependency_parse_result = dependency_parse_result
+        self.dependency_paths: Tuple[Dependency, ...] = (
+            dependency_parse_result.dependencies
+            if dependency_parse_result is not None and dependency_parse_result.succeeded
+            else ()
+        )
         self.name = func.__name__
         try:
             # Used to validate the args passed to set/override/watch against
@@ -370,36 +377,39 @@ def computed(
     if func_or_flags is None:
         # @computed() with no arguments
         def wrap_without_args(func: F) -> ComputedFunctionDescriptor:
-            static_deps = parse_dependencies(func)
+            parse_result = parse_dependency_result(func)
             return ComputedFunctionDescriptor(
                 func=func,
                 flags=Flags.NONE,
                 inverse=inverse,
-                static_deps=static_deps,
+                static_deps=parse_result.names if parse_result.succeeded else None,
+                dependency_parse_result=parse_result,
             )
         return wrap_without_args
 
     if callable(func_or_flags):
         # @computed without parentheses
         func = func_or_flags
-        static_deps = parse_dependencies(func)
+        parse_result = parse_dependency_result(func)
         return ComputedFunctionDescriptor(
             func=func,
             flags=Flags.NONE,
             inverse=None,
-            static_deps=static_deps,
+            static_deps=parse_result.names if parse_result.succeeded else None,
+            dependency_parse_result=parse_result,
         )
 
     # @computed(flags) or @computed(flags, inverse=...)
     flags = func_or_flags
 
     def wrap_with_flags(func: F) -> ComputedFunctionDescriptor:
-        static_deps = parse_dependencies(func)
+        parse_result = parse_dependency_result(func)
         return ComputedFunctionDescriptor(
             func=func,
             flags=flags,
             inverse=inverse,
-            static_deps=static_deps,
+            static_deps=parse_result.names if parse_result.succeeded else None,
+            dependency_parse_result=parse_result,
         )
 
     return wrap_with_flags

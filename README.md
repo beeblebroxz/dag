@@ -255,13 +255,26 @@ with stressed_branch:
 
 ### Untracked Mode
 
-The DAG enforces that runtime dependencies must be declared statically. Use
-`dag.untracked(...)` for intentional dynamic access patterns that should not be
-tracked as dependencies of the caller.
+The DAG enforces that calls to computed functions on `self` were declared by
+static parsing. Cross-object calls cannot be fully resolved statically, so they
+are accepted and tracked at runtime. Use `dag.untracked(...)` only for
+intentional calls that should not become dependencies of the caller.
 
 ```python
 result = dag.untracked(lambda: model.Compute())
 ```
+
+### Dependency Parsing
+
+The parser follows calls rooted at `self` and function arguments through
+aliases, call chains, registry subscripts, loops, comprehensions, conditionals,
+and starred arguments. `dag.parse_dependency_result(func)` returns structured
+`DependencyPath` values and an explicit `ParseStatus`; the compatibility API
+`dag.parse_dependencies(func)` continues to return a name set or `None` when
+source is unavailable.
+
+Each computed descriptor exposes `dependency_paths` and
+`dependency_parse_result` for diagnostics and tooling.
 
 ## API Reference
 
@@ -293,6 +306,7 @@ e.g. `obj.Price.set(155.0, "AAPL")`.
 ### Functions
 - `dag.flush()` - Dispatch pending notifications
 - `dag.reset()` - Reset the DAG (for testing)
+- `dag.parse_dependency_result(func)` - Return structured dependency paths and parse status
 
 ## Testing
 

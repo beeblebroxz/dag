@@ -595,3 +595,98 @@ class TestExplicitInvalidate:
 
         f.Data.invalidate()               # explicit retry hook
         assert f.Data() == 42.0
+
+
+class TestSubscriptionChangesDuringDispatch:
+    """A watch or unwatch made by a callback while flush() is dispatching
+    must not be undone (review 2026-11-09, correctness 5)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _model():
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+        m = Model()
+        m.A()
+        return m
+
+    def test_watch_added_by_a_callback_is_kept(self):
+        m = self._model()
+        calls = []
+
+        def second(node):
+            calls.append('second')
+
+        def first(node):
+            calls.append('first')
+            if calls.count('first') == 1:
+                m.A.watch(second)
+
+        m.A.watch(first)
+        m.A.set(2)
+        dag.flush()
+        assert calls == ['first']  # not called in the flush that added it
+
+        m.A.set(3)
+        dag.flush()
+        assert calls == ['first', 'first', 'second']
+
+    def test_callback_that_unwatches_itself_is_not_called_again(self):
+        m = self._model()
+        calls = []
+
+        def once(node):
+            calls.append('once')
+            m.A.unwatch(once)
+
+        def always(node):
+            calls.append('always')
+
+        m.A.watch(once)
+        m.A.watch(always)
+        m.A.set(2)
+        dag.flush()
+        m.A.set(3)
+        dag.flush()
+
+        assert calls == ['once', 'always', 'always']
+
+    def test_callback_unwatched_earlier_in_the_same_flush_is_skipped(self):
+        m = self._model()
+        calls = []
+
+        def later(node):
+            calls.append('later')
+
+        def remover(node):
+            calls.append('remover')
+            m.A.unwatch(later)
+
+        m.A.watch(remover)
+        m.A.watch(later)
+        m.A.set(2)
+        dag.flush()
+
+        assert calls == ['remover']
+
+    def test_last_callback_unwatching_itself_leaves_no_subscription(self):
+        from dag.core import DagManager
+
+        m = self._model()
+
+        def once(node):
+            m.A.unwatch(once)
+
+        m.A.watch(once)
+        m.A.set(2)
+        dag.flush()
+        m.A.set(3)
+
+        manager = DagManager.get_instance()
+        assert manager._subscriptions == {}
+        assert manager._pending_notifications == set()

@@ -283,7 +283,9 @@ Each computed descriptor exposes `dependency_paths` and
 - `@dag.computed(dag.Input)` - Allow permanent value changes
 - `@dag.computed(dag.Overridable)` - Allow temporary overrides
 - `@dag.computed(dag.Optional)` - Return `dag.NO_VALUE` on errors (the
-  result is cached like any other; call `func.invalidate()` to retry)
+  result is cached like any other; call `func.invalidate()` to retry).
+  `UntrackedError` and `CycleError` still raise, since they report a
+  mistake in the model rather than a failed calculation
 
 ### Computed Function Methods
 - `func(*args)` - Get the current value

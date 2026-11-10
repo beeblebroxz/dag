@@ -612,3 +612,400 @@ class TestOverrideSetEdgeCases:
             overrides.apply(ctx)
             assert obj.A() == 10
             assert obj.B() == 20
+
+
+class TestErrorInvalidation:
+    """A node in ERROR must not stop invalidation from reaching its
+    dependents (review 2026-11-09, correctness 1)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_cell_catching_dependency_error_refreshes(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Denominator(self):
+                return 0
+
+            @dag.computed
+            def Ratio(self):
+                return 10 / self.Denominator()
+
+            @dag.computed
+            def Safe(self):
+                try:
+                    return self.Ratio()
+                except Exception:
+                    return "n/a"
+
+        m = Model()
+        assert m.Safe() == "n/a"
+
+        m.Denominator.set(5)
+        assert m.Safe() == 2.0
+
+        m.Denominator.set(0)
+        assert m.Safe() == "n/a"
+
+    def test_optional_cell_refreshes_when_dependency_error_clears(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Denominator(self):
+                return 0
+
+            @dag.computed
+            def Ratio(self):
+                return 10 / self.Denominator()
+
+            @dag.computed(dag.Optional)
+            def Suppressed(self):
+                return self.Ratio() + 1
+
+        m = Model()
+        assert m.Suppressed() is dag.NO_VALUE
+
+        m.Denominator.set(5)
+        assert m.Suppressed() == 3.0
+
+    def test_invalidation_crosses_a_chain_of_error_nodes(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Denominator(self):
+                return 0
+
+            @dag.computed
+            def Ratio(self):
+                return 10 / self.Denominator()
+
+            @dag.computed
+            def Doubled(self):
+                return self.Ratio() * 2
+
+            @dag.computed
+            def Safe(self):
+                try:
+                    return self.Doubled()
+                except Exception:
+                    return "n/a"
+
+        m = Model()
+        assert m.Safe() == "n/a"
+
+        m.Denominator.set(5)
+        assert m.Safe() == 4.0
+
+    def test_watcher_of_error_node_is_notified_when_input_changes(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Denominator(self):
+                return 0
+
+            @dag.computed
+            def Ratio(self):
+                return 10 / self.Denominator()
+
+        m = Model()
+        try:
+            m.Ratio()
+        except dag.EvaluationError:
+            pass
+
+        events = []
+
+        def on_change(node):
+            events.append(node.method_name)
+
+        m.Ratio.watch(on_change)
+        m.Denominator.set(5)
+        dag.flush()
+
+        assert events == ['Ratio']
+        assert m.Ratio() == 2.0
+
+
+class TestObjectNodeIndex:
+    """Releasing an object must touch only that object's nodes
+    (review 2026-11-09, performance 1)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _model():
+        class Chain(dag.Model):
+            @dag.computed(dag.Input)
+            def A(self):
+                return 1
+
+            @dag.computed
+            def B(self):
+                return self.A() + 1
+
+            @dag.computed
+            def C(self):
+                return self.B() + 1
+
+        return Chain
+
+    def test_nodes_of_one_object_share_a_weak_reference(self):
+        from dag.core import DagManager
+
+        obj = self._model()()
+        assert obj.C() == 3
+
+        manager = DagManager.get_instance()
+        refs = {id(node.obj_ref) for node in manager._nodes.values()}
+        assert len(manager._nodes) == 3
+        assert len(refs) == 1
+
+    def test_gc_removes_only_the_dead_objects_nodes(self):
+        from dag.core import DagManager
+
+        Chain = self._model()
+        dead, alive = Chain(), Chain()
+        assert dead.C() == 3
+        assert alive.C() == 3
+
+        manager = DagManager.get_instance()
+        dead_id = id(dead)
+        del dead
+        gc.collect()
+
+        assert {key.obj_id for key in manager._nodes} == {id(alive)}
+        assert dead_id not in manager._object_nodes
+        assert dead_id not in manager._object_refs
+        assert len(manager._object_nodes[id(alive)]) == 3
+
+        alive.A.set(10)
+        assert alive.C() == 12
+
+    def test_stale_cleanup_callback_is_ignored(self):
+        """A callback for a reference that is no longer registered (the id
+        now belongs to another object) must not remove the live nodes."""
+        import weakref
+        from dag.core import DagManager
+
+        obj = self._model()()
+        assert obj.C() == 3
+
+        manager = DagManager.get_instance()
+        manager._cleanup_object_nodes(id(obj), weakref.ref(obj))
+
+        assert len(manager._nodes) == 3
+        assert obj.C() == 3
+
+    def test_dependent_on_another_object_recomputes_after_gc(self):
+        class Leaf(dag.Model):
+            @dag.computed
+            def Value(self):
+                return 7
+
+        class Holder(dag.Model):
+            @dag.computed(dag.Input)
+            def Target(self):
+                return None
+
+            @dag.computed
+            def Total(self):
+                target = self.Target()
+                return target.Value() if target is not None else 0
+
+        holder, leaf = Holder(), Leaf()
+        holder.Target.set(leaf)
+        assert holder.Total() == 7
+
+        holder.Target.set(None)
+        del leaf
+        gc.collect()
+
+        assert holder.Total() == 0
+
+
+class TestTemporaryModelInsideCell:
+    """A cell that creates a model, reads it and lets it die must still hear
+    about changes to what that model depended on (review 2026-11-09, "found
+    while fixing")."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_change_to_what_the_temporary_model_read_reaches_its_creator(self):
+        calls = []
+
+        class Market(dag.Model):
+            @dag.computed(dag.Input)
+            def Spot(self):
+                return 100.0
+
+        market = Market()
+
+        class Pricer(dag.Model):
+            @dag.computed
+            def Price(self):
+                return market.Spot() * 2
+
+        class Holder(dag.Model):
+            @dag.computed
+            def Total(self):
+                calls.append(1)
+                return Pricer().Price() + 1
+
+        holder = Holder()
+        assert holder.Total() == 201.0
+        assert holder.Total() == 201.0
+        assert len(calls) == 1  # still cached
+
+        market.Spot.set(50.0)
+        assert holder.Total() == 101.0
+        assert len(calls) == 2
+
+    def test_dependency_several_cells_deep_in_the_temporary_model(self):
+        class Market(dag.Model):
+            @dag.computed(dag.Input)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def Unread(self):
+                return 1
+
+        market = Market()
+
+        class Pricer(dag.Model):
+            @dag.computed
+            def Half(self):
+                return market.Spot() / 2
+
+            @dag.computed
+            def Price(self):
+                return self.Half() + 1
+
+        class Holder(dag.Model):
+            @dag.computed
+            def Total(self):
+                return Pricer().Price() * 10
+
+            @dag.computed
+            def Report(self):
+                return self.Total() + 0.5
+
+        holder = Holder()
+        assert holder.Report() == 510.5
+
+        market.Spot.set(50.0)
+        assert holder.Total() == 260.0
+        assert holder.Report() == 260.5
+
+    def test_no_nodes_are_left_behind_for_the_temporary_model(self):
+        from dag.core import DagManager
+
+        class Leaf(dag.Model):
+            @dag.computed
+            def Value(self):
+                return 7
+
+        class Holder(dag.Model):
+            @dag.computed
+            def Total(self):
+                return Leaf().Value() + 1
+
+        holder = Holder()
+        assert holder.Total() == 8
+
+        manager = DagManager.get_instance()
+        assert {key.obj_id for key in manager._nodes} == {id(holder)}
+
+
+class TestOptionalDoesNotHideModelErrors:
+    """Optional turns failed calculations into NO_VALUE, but an undeclared
+    dependency or a cycle is a mistake in the model and must still raise
+    (review 2026-11-09, correctness 6)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _root_cause(error):
+        while isinstance(error, dag.EvaluationError):
+            error = error.original_error
+        return error
+
+    def test_undeclared_dependency_in_optional_cell_raises(self):
+        import pytest
+
+        class Model(dag.Model):
+            @dag.computed
+            def A(self):
+                return 1
+
+            def helper(self):
+                return self.A()
+
+            @dag.computed(dag.Optional)
+            def B(self):
+                return self.helper() + 1
+
+        with pytest.raises(dag.UntrackedError):
+            Model().B()
+
+    def test_undeclared_dependency_below_optional_cell_raises(self):
+        import pytest
+
+        class Model(dag.Model):
+            @dag.computed
+            def A(self):
+                return 1
+
+            def helper(self):
+                return self.A()
+
+            @dag.computed
+            def Broken(self):
+                return self.helper() + 1
+
+            @dag.computed(dag.Optional)
+            def B(self):
+                return self.Broken() + 1
+
+        with pytest.raises(dag.UntrackedError):
+            Model().B()
+
+    def test_cycle_through_optional_cell_raises(self):
+        import pytest
+
+        class Model(dag.Model):
+            @dag.computed(dag.Optional)
+            def A(self):
+                return self.B() + 1
+
+            @dag.computed
+            def B(self):
+                return self.A() + 1
+
+        for name in ('A', 'B'):
+            dag.reset()
+            with pytest.raises(dag.EvaluationError) as info:
+                getattr(Model(), name)()
+            assert isinstance(self._root_cause(info.value), dag.CycleError)
+
+    def test_failed_calculation_is_still_suppressed(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Denominator(self):
+                return 0
+
+            @dag.computed
+            def Ratio(self):
+                return 10 / self.Denominator()
+
+            @dag.computed(dag.Optional)
+            def Direct(self):
+                return 10 / self.Denominator()
+
+            @dag.computed(dag.Optional)
+            def Indirect(self):
+                return self.Ratio() + 1
+
+        m = Model()
+        assert m.Direct() is dag.NO_VALUE
+        assert m.Indirect() is dag.NO_VALUE

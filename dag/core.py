@@ -22,6 +22,7 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -29,7 +30,13 @@ from typing import (
     Tuple,
 )
 
-from .exceptions import ConcurrentScenarioError, CycleError, EvaluationError, UntrackedError
+from .exceptions import (
+    ConcurrentScenarioError,
+    CycleError,
+    EvaluationError,
+    OverrideError,
+    UntrackedError,
+)
 from .flags import NO_VALUE, Flags
 
 if TYPE_CHECKING:
@@ -105,6 +112,10 @@ class Node:
         compare=False,
     )
     _evaluating_thread_id: Optional[int] = field(default=None, repr=False, compare=False)
+    # Bumped whenever an invalidation reaches this node from a thread other
+    # than its evaluator. An evaluation compares the count before and after
+    # to detect that an input changed underneath it (see DagManager._settle).
+    _invalidation_count: int = field(default=0, repr=False, compare=False)
 
     @property
     def value(self) -> Any:
@@ -122,11 +133,41 @@ class Node:
     def has_set_value(self) -> bool:
         return self._set_value is not NO_VALUE
 
+    @property
+    def has_result(self) -> bool:
+        """Whether the last evaluation finished, with a value or an error.
+
+        Dependents may have consumed either outcome (a dependent can catch a
+        dependency's exception and cache a fallback), so invalidation must
+        treat an ERROR node like a VALID one.
+        """
+        return self._state in (NodeState.VALID, NodeState.ERROR)
+
     def invalidate(self) -> None:
-        """Mark this node as needing recalculation."""
-        if self._state == NodeState.VALID:
-            self._state = NodeState.INVALID
-            self._value = NO_VALUE
+        """Mark this node as needing recalculation, discarding a cached
+        value or a cached error.
+
+        May be called from any thread, with or without the node's lock.
+        The state and the value must change together: if they were written
+        one after the other with no lock, another thread could re-evaluate
+        the node in between and be left VALID with its value wiped. So the
+        change is made under the node's lock when that is free. The lock is
+        never waited for, because invalidation can run from a garbage
+        collection callback while this thread holds other locks. If it is
+        busy, only the state is flipped (one write, nothing to tear) and the
+        stale value stays until the next evaluation replaces it.
+        """
+        if not self._condition.acquire(blocking=False):
+            if self.has_result:
+                self._state = NodeState.INVALID
+            return
+        try:
+            if self.has_result:
+                self._state = NodeState.INVALID
+                self._value = NO_VALUE
+                self._error = None
+        finally:
+            self._condition.release()
 
     def set_valid(self, value: Any) -> None:
         """Mark this node as valid with the given value."""
@@ -189,6 +230,12 @@ class DagManager:
     def _init(self) -> None:
         """Initialize the DAG manager."""
         self._nodes: Dict[NodeKey, Node] = {}
+        # Per-object index, so releasing an object touches only its own
+        # nodes: obj id -> keys of its nodes, and obj id -> the one weak
+        # reference (shared by all of the object's nodes) whose callback
+        # cleans them up. Both are guarded by _nodes_lock.
+        self._object_nodes: Dict[int, Set[NodeKey]] = {}
+        self._object_refs: Dict[int, weakref.ref] = {}
         self._nodes_lock = threading.RLock()
         self._thread_state = threading.local()
         self._layer_counter: int = 0
@@ -282,25 +329,50 @@ class DagManager:
 
         state.dependency_stack[-1].add(to_node.key)
 
-    def _prepare_dependencies(self, node: Node) -> None:
-        """Clear the current runtime dependency edges for a node before recomputing."""
-        with self._nodes_lock:
-            previous_inputs = list(node.inputs)
-            node.inputs.clear()
+        # Install the output edge now, before the caller reads to_node's
+        # value, rather than when the caller finishes. A change to to_node
+        # made by another thread while the caller is still evaluating then
+        # finds the caller and marks its result stale.
+        if from_node.key not in to_node.outputs:
+            with self._nodes_lock:
+                to_node.outputs.add(from_node.key)
 
-            for input_key in previous_inputs:
+    def _finalize_dependencies(self, node: Node, new_inputs: Set[NodeKey]) -> None:
+        """Make a node's input edges exactly those its evaluation discovered.
+
+        The edges from the previous evaluation stay in place while the node
+        recomputes, so an invalidation arriving mid-evaluation still reaches
+        it; only here, once the new inputs are known, are the edges to inputs
+        it no longer reads removed.
+        """
+        with self._nodes_lock:
+            stale_inputs = node.inputs - new_inputs
+            node.inputs = new_inputs
+            for input_key in stale_inputs:
                 input_node = self._nodes.get(input_key)
                 if input_node is not None:
                     input_node.outputs.discard(node.key)
-
-    def _finalize_dependencies(self, node: Node, new_inputs: Set[NodeKey]) -> None:
-        """Install the runtime dependency edges discovered during evaluation."""
-        with self._nodes_lock:
-            node.inputs = set(new_inputs)
             for input_key in new_inputs:
                 input_node = self._nodes.get(input_key)
                 if input_node is not None:
                     input_node.outputs.add(node.key)
+
+    def _settle(self, node: Node, started_at: int) -> None:
+        """Finish an evaluation whose outcome was just stored on the node.
+
+        If an invalidation from another thread reached the node while it was
+        evaluating, the outcome was computed from an input that has since
+        changed: it is discarded and the node left INVALID, so the next read
+        recomputes. Storing the outcome first and checking the count second
+        pairs with ``_mark_stale``, which bumps the count first and reads the
+        state second, so one of the two always sees the other.
+
+        Caller must hold ``node._condition``.
+        """
+        if node._invalidation_count != started_at:
+            node.invalidate()
+        node._evaluating_thread_id = None
+        node._condition.notify_all()
 
     def _validate_dependency(self, from_node: Node, to_node: Node) -> None:
         """Ensure a runtime dependency was declared statically.
@@ -329,34 +401,71 @@ class DagManager:
             "Wrap the call in dag.untracked(...) if this is intentional."
         )
 
-    def _cleanup_object_nodes(self, obj_id: int) -> None:
-        """Remove nodes for an object that has been garbage-collected."""
-        stale_nodes: List[Node] = []
+    def _cleanup_object_nodes(
+        self,
+        obj_id: int,
+        dead_ref: Optional[weakref.ref] = None,
+    ) -> None:
+        """Remove nodes for an object that has been garbage-collected.
+
+        ``dead_ref`` is the weak reference whose callback triggered the
+        cleanup. If it is no longer the one registered for ``obj_id`` (the
+        manager was reset, or the id now belongs to another object), the
+        call is stale and does nothing.
+        """
+        dead: Dict[NodeKey, Node] = {}
         stale_outputs: List[Node] = []
+        thread_id = threading.get_ident()
+        exec_state = self._get_execution_state()
+        # Dependents this thread is evaluating, with the dead nodes each one
+        # read. Only possible when the object died inside an evaluation.
+        orphaned: Dict[NodeKey, Tuple[Node, List[Node]]] = {}
 
         with self._nodes_lock:
-            keys_to_remove = [key for key in self._nodes if key.obj_id == obj_id]
-            for key in keys_to_remove:
+            if dead_ref is not None and self._object_refs.get(obj_id) is not dead_ref:
+                return
+            self._object_refs.pop(obj_id, None)
+            # Unregister every node first, so the lookups below find only
+            # surviving nodes and the dead nodes' own edges stay intact.
+            for key in self._object_nodes.pop(obj_id, ()):
                 node = self._nodes.pop(key, None)
-                if node is None:
-                    continue
+                if node is not None:
+                    dead[key] = node
 
-                stale_nodes.append(node)
-
-                for input_key in list(node.inputs):
+            for node in dead.values():
+                for input_key in node.inputs:
                     input_node = self._nodes.get(input_key)
                     if input_node is not None:
                         input_node.outputs.discard(node.key)
 
-                for output_key in list(node.outputs):
+                for output_key in node.outputs:
                     output_node = self._nodes.get(output_key)
-                    if output_node is not None:
-                        output_node.inputs.discard(node.key)
-                        stale_outputs.append(output_node)
+                    if output_node is None:
+                        continue
+                    output_node.inputs.discard(node.key)
+                    stale_outputs.append(output_node)
+                    if exec_state.eval_stack and self._is_evaluating_here(output_node, thread_id):
+                        orphaned.setdefault(output_key, (output_node, []))[1].append(node)
+
+            # A temporary model created and released inside an evaluation:
+            # the evaluating node keeps its result, so it takes over what the
+            # dead nodes depended on, or it would never hear of a change.
+            for target, consumed in orphaned.values():
+                donors: Dict[NodeKey, Node] = {}
+                pending = list(consumed)
+                while pending:
+                    node = pending.pop()
+                    if node.key in donors:
+                        continue
+                    donors[node.key] = node
+                    pending.extend(
+                        dead[input_key] for input_key in node.inputs if input_key in dead
+                    )
+                self._adopt_inputs(target, donors.values(), exec_state)
 
         with self._subscriptions_lock:
-            for node in stale_nodes:
-                self._subscriptions.pop(node.key, None)
+            for key in dead:
+                self._subscriptions.pop(key, None)
 
         for output_node in stale_outputs:
             self.invalidate_node(output_node)
@@ -373,25 +482,41 @@ class DagManager:
         """Get an existing node or create a new one."""
         key = NodeKey(id(obj), method_name, args)
         with self._nodes_lock:
-            if key not in self._nodes:
-                manager_ref = weakref.ref(self)
-
-                def _on_object_gc(_ref: weakref.ReferenceType[Model], *, obj_id: int = id(obj)) -> None:
-                    manager = manager_ref()
-                    if manager is not None:
-                        manager._cleanup_object_nodes(obj_id)
-
+            node = self._nodes.get(key)
+            if node is None:
                 node = Node(
                     key=key,
-                    obj_ref=weakref.ref(obj, _on_object_gc),
+                    obj_ref=self._object_ref(obj),
                     method_name=method_name,
                     func=func,
                     flags=flags,
                     static_deps=static_deps,
                 )
                 self._nodes[key] = node
+                self._object_nodes.setdefault(key.obj_id, set()).add(key)
 
-            return self._nodes[key]
+            return node
+
+    def _object_ref(self, obj: Model) -> weakref.ref:
+        """Return the weak reference shared by all of obj's nodes, creating
+        it (with the cleanup callback) on first use.
+
+        One reference per object means one callback when the object dies,
+        rather than one per node. Caller must hold ``_nodes_lock``.
+        """
+        obj_id = id(obj)
+        obj_ref = self._object_refs.get(obj_id)
+        if obj_ref is None or obj_ref() is not obj:
+            manager_ref = weakref.ref(self)
+
+            def _on_object_gc(dead_ref: weakref.ref) -> None:
+                manager = manager_ref()
+                if manager is not None:
+                    manager._cleanup_object_nodes(obj_id, dead_ref)
+
+            obj_ref = weakref.ref(obj, _on_object_gc)
+            self._object_refs[obj_id] = obj_ref
+        return obj_ref
 
     def get_node(self, key: NodeKey) -> Optional[Node]:
         """Get a node by its key."""
@@ -427,6 +552,7 @@ class DagManager:
 
         current_thread_id = threading.get_ident()
         cycle_error: Optional[CycleError] = None
+        started_at = 0
 
         with node._condition:
             # Re-checked on every iteration: after waking from wait() the node
@@ -464,14 +590,16 @@ class DagManager:
                         self._unregister_wait(current_thread_id)
                     continue
 
-                node._state = NodeState.EVALUATING
                 node._evaluating_thread_id = current_thread_id
+                node._state = NodeState.EVALUATING
+                # Read after the state is published: an invalidation that
+                # arrives from here on is seen by _settle.
+                started_at = node._invalidation_count
                 break
 
         if cycle_error is not None:
             raise cycle_error
 
-        self._prepare_dependencies(node)
         state.eval_stack.append(node.key)
         state.dependency_stack.append(set())
         previous_evaluating = state.evaluating_node
@@ -490,21 +618,21 @@ class DagManager:
             # Cache the result
             with node._condition:
                 node.set_valid(result)
-                node._evaluating_thread_id = None
-                node._condition.notify_all()
+                self._settle(node, started_at)
             return result
 
         except Exception as e:
             with node._condition:
-                if node.flags & Flags.Optional:
+                # Optional covers failed calculations. An undeclared
+                # dependency or a cycle is a mistake in the model, here or in
+                # anything this node called, and has to surface.
+                if node.flags & Flags.Optional and not self._is_model_error(e):
                     node.set_valid(NO_VALUE)
-                    node._evaluating_thread_id = None
-                    node._condition.notify_all()
+                    self._settle(node, started_at)
                     return NO_VALUE
 
                 node.set_error(e)
-                node._evaluating_thread_id = None
-                node._condition.notify_all()
+                self._settle(node, started_at)
 
             if isinstance(e, UntrackedError):
                 raise
@@ -516,6 +644,15 @@ class DagManager:
             self._finalize_dependencies(node, discovered_inputs)
             state.eval_stack.pop()
             state.evaluating_node = previous_evaluating
+
+    @staticmethod
+    def _is_model_error(error: BaseException) -> bool:
+        """Whether error reports a mistake in the model rather than a failed
+        calculation: an UntrackedError or CycleError, however many
+        EvaluationErrors it was wrapped in on the way up."""
+        while isinstance(error, EvaluationError):
+            error = error.original_error
+        return isinstance(error, (UntrackedError, CycleError))
 
     def invalidate_node(self, node: Node, propagate_only: bool = False) -> None:
         """
@@ -530,36 +667,198 @@ class DagManager:
             propagate_only: If True, only propagate to dependents without
                            invalidating this node (used when set changes)
         """
-        if not propagate_only:
-            if not node.is_valid:
-                return
-            node.invalidate()
+        if propagate_only:
+            self._queue_subscription(node.key)
+            self._walk_invalidation(node, reset_root=False, always_propagate=True)
+        else:
+            self._walk_invalidation(node, reset_root=True, always_propagate=False)
 
-        # Queue a notification for the starting node, then walk its dependents.
-        self._queue_subscription(node.key)
-        stack: List[NodeKey] = list(node.outputs)
+    def _walk_invalidation(
+        self,
+        root: Node,
+        *,
+        reset_root: bool,
+        always_propagate: bool,
+    ) -> None:
+        """Walk the dependents of root, invalidating them.
+
+        Args:
+            root: Where the change happened.
+            reset_root: Invalidate root itself, if it holds a result.
+            always_propagate: Visit root's dependents even when root was not
+                reset. Needed when root's visible value changed without its
+                state changing (a set value or an override served from an
+                INVALID node).
+
+        A walk started from inside an evaluation on this thread (an on-graph
+        scenario applying or reverting an override) can invalidate nodes
+        that an evaluating node has already consumed. That node will finish
+        VALID above INVALID inputs, and an INVALID node stops later walks, so
+        the evaluating node would never hear about changes further up. To
+        prevent that, the walk records which nodes it reset on the way to
+        each evaluating node, and the evaluating node inherits their inputs
+        as direct dependencies (see ``_inherit_inputs``).
+        """
+        thread_id = threading.get_ident()
+        exec_state = self._get_execution_state()
+        # Only then can the walk reach a node this thread is evaluating.
+        tracking = bool(exec_state.eval_stack)
+        # Nodes passed through while another thread evaluates them. They do
+        # not change state, so unlike invalidated nodes they need an explicit
+        # visited set to keep a cyclic edge from looping the walk forever.
+        in_flight: Set[NodeKey] = set()
+        # Used only when tracking: nodes this walk reset, the walk's edges
+        # in reverse (child -> parents), and the evaluating nodes it reached.
+        reset: Dict[NodeKey, Node] = {}
+        parents: Dict[NodeKey, List[NodeKey]] = {}
+        reached: Dict[NodeKey, Node] = {}
+        stack: List[NodeKey] = []
+
+        def visit_dependents(node: Node, was_reset: bool) -> None:
+            outputs = list(node.outputs)
+            if tracking and was_reset:
+                reset[node.key] = node
+                for output_key in outputs:
+                    parents.setdefault(output_key, []).append(node.key)
+            stack.extend(outputs)
+
+        root_reset = (
+            reset_root
+            and not self._is_evaluating_here(root, thread_id)
+            and self._mark_stale(root, thread_id, in_flight)
+        )
+        if not (root_reset or always_propagate):
+            return
+        visit_dependents(root, root_reset)
 
         while stack:
             output_node = self.get_node(stack.pop())
-            # Skip missing nodes and ones already invalid: an invalid node's
-            # dependents were invalidated when it first became invalid.
-            if output_node is None or not output_node.is_valid:
+            if output_node is None:
                 continue
-            output_node.invalidate()
-            self._queue_subscription(output_node.key)
-            stack.extend(output_node.outputs)
+            if tracking and self._is_evaluating_here(output_node, thread_id):
+                reached[output_node.key] = output_node
+                continue
+            if self._mark_stale(output_node, thread_id, in_flight):
+                visit_dependents(output_node, True)
 
-    def invalidate_dependents(self, node: Node) -> None:
-        """
-        Invalidate only the dependents of a node, not the node itself.
+        for target in reached.values():
+            self._inherit_inputs(target, reset, parents, exec_state)
 
-        Used when a node's value is explicitly set - the node stays valid
-        with its set value, but dependents need to recompute.
+    @staticmethod
+    def _is_evaluating_here(node: Node, thread_id: int) -> bool:
+        """Whether node is being evaluated by the given (current) thread."""
+        return (
+            node._state is NodeState.EVALUATING
+            and node._evaluating_thread_id == thread_id
+        )
+
+    def _inherit_inputs(
+        self,
+        target: Node,
+        reset: Dict[NodeKey, Node],
+        parents: Dict[NodeKey, List[NodeKey]],
+        exec_state: _ExecutionState,
+    ) -> None:
+        """Make target, a node this thread is evaluating, depend directly on
+        the inputs of every node a walk reset on its way to target.
+
+        Those nodes are what target consumed and has now lost: they are
+        INVALID, so they will not forward later invalidations, and when they
+        are next evaluated (outside the scenario, possibly along a different
+        code path) their own input edges may change. Their inputs as of now
+        are exactly what target's result depends on.
         """
-        for output_key in list(node.outputs):
-            output_node = self.get_node(output_key)
-            if output_node is not None:
-                self.invalidate_node(output_node)
+        # Reset nodes from which the walk reached target.
+        upstream: Dict[NodeKey, Node] = {}
+        pending = list(parents.get(target.key, ()))
+        while pending:
+            key = pending.pop()
+            node = reset.get(key)
+            if node is None or key in upstream:
+                continue
+            upstream[key] = node
+            pending.extend(parents.get(key, ()))
+
+        # Inputs that were themselves reset are adopted too: a settable or
+        # overridable one can still change directly, and that walk starts
+        # from its own dependents.
+        self._adopt_inputs(target, upstream.values(), exec_state)
+
+    def _adopt_inputs(
+        self,
+        target: Node,
+        donors: Iterable[Node],
+        exec_state: _ExecutionState,
+    ) -> None:
+        """Add the inputs of donors to the dependencies of target, a node
+        this thread is evaluating, installing the edges immediately."""
+        try:
+            depth = exec_state.eval_stack.index(target.key)
+        except ValueError:
+            return
+        discovered = exec_state.dependency_stack[depth]
+
+        with self._nodes_lock:
+            for node in donors:
+                for input_key in node.inputs:
+                    input_node = self._nodes.get(input_key)
+                    if input_node is None or input_key == target.key:
+                        continue
+                    discovered.add(input_key)
+                    input_node.outputs.add(target.key)
+
+    def _mark_stale(self, node: Node, thread_id: int, in_flight: Set[NodeKey]) -> bool:
+        """Apply an invalidation to one node; return whether its dependents
+        must be visited too.
+
+        - INVALID: nothing to do. Its dependents were invalidated when it
+          became INVALID.
+        - VALID or ERROR: reset to INVALID. ERROR is included because a
+          dependent that caught the error is VALID with a fallback and must
+          recompute once the error may clear.
+        - EVALUATING on this thread: the change comes from inside the node's
+          own evaluation (an on-graph scenario, or the release of a temporary
+          model), and the evaluation already accounts for it. Left alone.
+        - EVALUATING on another thread: that evaluation may have read the
+          old input. The count is bumped so ``_settle`` discards its result,
+          and the walk continues: the callers waiting for this result up
+          that thread's stack are EVALUATING dependents and get the same
+          treatment.
+
+        Never waits for a lock. Correctness against a concurrent
+        ``_settle`` relies on ordering: the count is bumped before the state
+        is read.
+        """
+        if self._is_evaluating_here(node, thread_id):
+            return False
+
+        node._invalidation_count += 1
+        state = node._state
+        if state is NodeState.INVALID:
+            return False
+        if state is NodeState.EVALUATING:
+            if node.key in in_flight:
+                return False
+            in_flight.add(node.key)
+        else:
+            node.invalidate()
+        self._queue_subscription(node.key)
+        return True
+
+    def invalidate_dependents(self, node: Node, reset: bool = False) -> None:
+        """
+        Invalidate the dependents of a node, whatever the node's own state.
+
+        Used when a node's visible value changes through a set value or an
+        override: the node may be INVALID (it serves the set value without
+        being evaluated), so its state says nothing about its dependents.
+
+        Args:
+            node: The node whose value changed.
+            reset: Also discard the node's own cached result, for a change
+                that reverts it to its computed value.
+        """
+        self._walk_invalidation(node, reset_root=reset, always_propagate=True)
 
     def set_node_value(self, node: Node, value: Any) -> None:
         """Permanently set a node's value, invalidating dependents and
@@ -586,8 +885,7 @@ class DagManager:
         """
         self._check_scenario_owner()
         node._set_value = NO_VALUE
-        node.invalidate()
-        self.invalidate_dependents(node)
+        self.invalidate_dependents(node, reset=True)
         self._queue_subscription(node.key)
 
     def add_dependency(self, from_node: Node, to_node: Node) -> None:
@@ -683,6 +981,11 @@ class DagManager:
             return state.context_stack[-1]
         return None
 
+    @property
+    def active_scenarios(self) -> Tuple[Scenario, ...]:
+        """The current thread's active scenarios, outermost first."""
+        return tuple(self._get_execution_state().context_stack)
+
     def next_layer_id(self) -> int:
         """Get the next branch ID."""
         with self._layer_lock:
@@ -746,12 +1049,14 @@ class DagManager:
             with self._subscriptions_lock:
                 callbacks = list(self._subscriptions.get(node_key, []))
 
-            live_callbacks = []
             for cb_ref in callbacks:
                 cb = cb_ref()
                 if cb is None:
                     continue
-                live_callbacks.append(cb_ref)
+                # An earlier callback in this dispatch may have unwatched it.
+                with self._subscriptions_lock:
+                    if cb_ref not in self._subscriptions.get(node_key, ()):
+                        continue
                 try:
                     cb(node)
                 except Exception:
@@ -761,9 +1066,17 @@ class DagManager:
                         "Watch callback for %r failed", node.method_name
                     )
 
+            # Drop dead references from the list as it stands now. Writing
+            # back the snapshot taken before dispatch would undo any watch or
+            # unwatch a callback (or another thread) made in the meantime.
             with self._subscriptions_lock:
-                if node_key in self._subscriptions:
-                    self._subscriptions[node_key] = live_callbacks
+                current = self._subscriptions.get(node_key)
+                if current is not None:
+                    alive = [ref for ref in current if ref() is not None]
+                    if alive:
+                        self._subscriptions[node_key] = alive
+                    else:
+                        del self._subscriptions[node_key]
 
 
 class Scenario:
@@ -777,6 +1090,11 @@ class Scenario:
     def __init__(self):
         self._dag = DagManager.get_instance()
         self._tweaks: List[Tuple[Node, Any]] = []  # (node, old_override_value)
+        # Hard references to every overridden object, keyed by id. Overrides
+        # are stored under NodeKey, which carries id(obj): if the object died
+        # mid-scenario, a new object allocated at the same address would
+        # inherit its overrides. Released when the scenario exits.
+        self._held_objects: Dict[int, Any] = {}
         self._layer_id = self._dag.next_layer_id()
 
     def __enter__(self) -> Scenario:
@@ -789,15 +1107,19 @@ class Scenario:
             # Revert all overrides
             for node, old_value in reversed(self._tweaks):
                 self._dag.set_tweak_value(node.key, old_value)
-                # Always invalidate dependents when reverting an override
-                # The node's dependents need to recompute with the original value
-                self._dag.invalidate_dependents(node)
-                if old_value is NO_VALUE:
-                    # Also invalidate this node since we're reverting to computed value
-                    node.invalidate()
+                # Always invalidate dependents when reverting an override:
+                # they need to recompute with the original value. When the
+                # node reverts to its computed value, its own cached result
+                # is discarded too, as part of the same walk, so that a node
+                # evaluating on this thread inherits its inputs.
+                self._dag.invalidate_dependents(node, reset=old_value is NO_VALUE)
                 # The reverted node changed too: notify its own watchers.
                 self._dag._queue_subscription(node.key)
         finally:
+            # The overrides are gone, so the objects no longer need pinning
+            # and a later re-entry must not revert them a second time.
+            self._tweaks.clear()
+            self._held_objects.clear()
             self._dag.pop_context()
             self._dag._release_scenario_ownership()
         return False
@@ -805,6 +1127,14 @@ class Scenario:
     def add_tweak(self, node: Node, new_value: Any) -> None:
         """Record an override for later reversion."""
         self._dag._check_scenario_owner()
+        obj = node.obj_ref()
+        if obj is None:
+            raise OverrideError(
+                node.method_name,
+                f"Cannot override '{node.method_name}': its object has been "
+                "garbage collected",
+            )
+        self._held_objects[node.key.obj_id] = obj
         old_value = self._dag.get_tweak_value(node.key)
         self._tweaks.append((node, old_value))
         self._dag.set_tweak_value(node.key, new_value)

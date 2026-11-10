@@ -708,3 +708,255 @@ class TestCrossThreadDeadlock:
         assert set(errors) == {"A", "B"}
         for exc in errors.values():
             assert isinstance(exc, (dag.CycleError, dag.EvaluationError))
+
+
+class TestChangeDuringEvaluation:
+    """A change made by one thread while another thread is evaluating a
+    dependent must not be lost (review 2026-11-09, correctness 2)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _slow_model():
+        started, release = threading.Event(), threading.Event()
+
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def X(self):
+                return 1
+
+            @dag.computed
+            def Slow(self):
+                x = self.X()
+                started.set()
+                release.wait(5)
+                return x * 100
+
+            @dag.computed
+            def Outer(self):
+                return self.Slow() + 1
+
+        return Model(), started, release
+
+    @staticmethod
+    def _run(target):
+        """Start target on a thread; return (thread, results list)."""
+        results = []
+        thread = threading.Thread(target=lambda: results.append(target()))
+        thread.start()
+        return thread, results
+
+    def test_set_during_first_evaluation_is_not_lost(self):
+        m, started, release = self._slow_model()
+        worker, results = self._run(m.Slow)
+        assert started.wait(5)
+
+        m.X.set(2)  # Slow is mid-evaluation on the worker thread
+        release.set()
+        worker.join(5)
+
+        # The in-flight call returns what it computed from the old input,
+        # but that result must not be cached.
+        assert results == [100]
+        assert m.Slow() == 200
+
+    def test_set_during_reevaluation_is_not_lost(self):
+        m, started, release = self._slow_model()
+        release.set()
+        assert m.Slow() == 100
+        m.X.set(5)  # invalidate, so the worker recomputes
+        started.clear()
+        release.clear()
+
+        worker, _results = self._run(m.Slow)
+        assert started.wait(5)
+        m.X.set(2)
+        release.set()
+        worker.join(5)
+
+        assert m.Slow() == 200
+
+    def test_callers_up_the_evaluating_stack_are_not_cached_either(self):
+        m, started, release = self._slow_model()
+        worker, results = self._run(m.Outer)
+        assert started.wait(5)
+
+        m.X.set(2)
+        release.set()
+        worker.join(5)
+
+        assert results == [101]
+        assert m.Outer() == 201
+
+    def test_thread_waiting_on_the_evaluation_recomputes(self):
+        from dag.core import DagManager
+
+        m, started, release = self._slow_model()
+        first, first_results = self._run(m.Slow)
+        assert started.wait(5)
+
+        second, second_results = self._run(m.Slow)
+        manager = DagManager.get_instance()
+        deadline = time.time() + 5
+        while second.ident not in manager._threads_waiting:
+            assert time.time() < deadline, "second thread never blocked"
+            time.sleep(0.001)
+
+        m.X.set(2)
+        release.set()
+        first.join(5)
+        second.join(5)
+
+        assert first_results == [100]
+        assert second_results == [200]
+        assert m.Slow() == 200
+
+    def test_watcher_is_notified_when_an_evaluation_is_discarded(self):
+        m, started, release = self._slow_model()
+        events = []
+
+        def on_change(node):
+            events.append(node.method_name)
+
+        m.Slow.watch(on_change)
+        worker, _results = self._run(m.Slow)
+        assert started.wait(5)
+
+        m.X.set(2)
+        release.set()
+        worker.join(5)
+        dag.flush()
+
+        # Slow ended up INVALID again, so its watcher must hear about it.
+        assert events == ['Slow']
+
+    def test_on_graph_scenario_does_not_discard_its_own_evaluation(self):
+        """Changes made on the evaluating thread itself (here an on-graph
+        scenario) must leave the node cacheable."""
+        calls = []
+
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() * 2
+
+            @dag.computed
+            def Delta(self):
+                calls.append(1)
+                spot = self.Spot()
+                base = self.Price()
+                with dag.scenario():
+                    self.Spot.override(spot + 1)
+                    up = self.Price()
+                return up - base
+
+        m = Model()
+        assert m.Delta() == 2.0
+        assert m.Delta() == 2.0
+        assert len(calls) == 1
+
+    def test_temporary_model_does_not_discard_its_creators_evaluation(self):
+        """A model created and released inside an evaluation invalidates its
+        dependents when it dies; the creator must still be cached."""
+        calls = []
+
+        class Leaf(dag.Model):
+            @dag.computed
+            def Value(self):
+                return 7
+
+        class Holder(dag.Model):
+            @dag.computed
+            def Total(self):
+                calls.append(1)
+                return Leaf().Value() + 1
+
+        holder = Holder()
+        assert holder.Total() == 8
+        assert holder.Total() == 8
+        assert len(calls) == 1
+
+    def test_invalidation_terminates_on_cyclic_in_flight_edges(self):
+        """Nodes being evaluated by another thread are passed through without
+        changing state, so a cycle among them must not loop forever."""
+        from dag.core import DagManager, NodeState
+
+        class Model(dag.Model):
+            @dag.computed
+            def A(self):
+                return 1
+
+            @dag.computed
+            def B(self):
+                return 2
+
+        m = Model()
+        a, b = m.A._get_or_create_node(), m.B._get_or_create_node()
+        for node in (a, b):
+            node._state = NodeState.EVALUATING
+            node._evaluating_thread_id = -1  # some other thread
+        a.outputs.add(b.key)
+        b.outputs.add(a.key)
+
+        DagManager.get_instance().invalidate_node(a)  # must return
+
+        assert a._invalidation_count >= 1
+        assert b._invalidation_count >= 1
+
+    def test_concurrent_writes_and_reads_converge(self):
+        """After writers and readers race, the cache must agree with the
+        final input."""
+        import sys
+
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def X(self):
+                return 0
+
+            @dag.computed
+            def Double(self):
+                return self.X() * 2
+
+            @dag.computed
+            def Total(self):
+                return self.Double() + self.X()
+
+        m = Model()
+        errors = []
+        done = threading.Event()
+
+        def reader():
+            try:
+                while not done.is_set():
+                    m.Total()
+            except Exception as e:  # pragma: no cover - reported below
+                errors.append(e)
+
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)
+        try:
+            readers = [threading.Thread(target=reader) for _ in range(4)]
+            for t in readers:
+                t.start()
+            stale = 0
+            for i in range(1, 1501):
+                m.X.set(i)
+                if i % 50 == 0:
+                    # No write is in flight now, so whatever the readers
+                    # cache from here on must reflect X == i.
+                    time.sleep(0.001)
+                    stale += m.Total() != 3 * i
+            done.set()
+            for t in readers:
+                t.join(5)
+        finally:
+            sys.setswitchinterval(old_interval)
+
+        assert errors == []
+        assert stale == 0
+        assert m.Total() == 3 * 1500

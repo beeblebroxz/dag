@@ -9,7 +9,9 @@ These flags control the behavior of computed functions:
 - Overridable: The value can be temporarily overridden (override)
 - Persisted: Combination of Input and Serialized (the Input bit is what
   makes Persisted cells settable)
-- Optional: Return NO_VALUE instead of raising exceptions
+- Optional: Return NO_VALUE instead of raising exceptions. UntrackedError
+  and CycleError still raise: they report a mistake in the model, not a
+  failed calculation.
 - CanChange: Indicates the cell can be modified (Input, Overridable, or has inverse)
 """
 

@@ -584,3 +584,384 @@ class TestGetOverridesDedup:
 
         assert len(ovs.overrides) == 1
         assert ovs.overrides[0].value == 2.0
+
+
+class TestScenarioHoldsOverriddenObjects:
+    """A scenario keeps its overridden objects alive, so an override can
+    never land on a new object allocated at a freed object's address
+    (review 2026-11-09, correctness 3)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _market():
+        class Market(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+        return Market
+
+    def test_overridden_object_survives_until_scenario_exit(self):
+        import gc
+        import weakref
+
+        m = self._market()()
+        ref = weakref.ref(m)
+
+        with dag.scenario():
+            m.Spot.override(1.0)
+            del m
+            gc.collect()
+            assert ref() is not None
+            assert ref().Spot() == 1.0
+
+        gc.collect()
+        assert ref() is None
+
+    def test_new_object_never_inherits_a_dead_objects_override(self):
+        import gc
+
+        Market = self._market()
+        with dag.scenario():
+            m = Market()
+            m.Spot.override(1.0)
+            address = id(m)
+            del m
+            gc.collect()
+
+            others = [Market() for _ in range(50)]
+            assert address not in {id(other) for other in others}
+            assert all(other.Spot() == 100.0 for other in others)
+
+    def test_override_set_scenario_releases_objects_on_exit(self):
+        import gc
+        import weakref
+
+        m = self._market()()
+        ref = weakref.ref(m)
+        overrides = dag.OverrideSet()
+        overrides.add(m, 'Spot', 1.0)
+
+        ctx = dag.apply_overrides(overrides)
+        with ctx:
+            assert m.Spot() == 1.0
+
+        del m, overrides
+        gc.collect()
+        assert ref() is None
+
+    def test_reentering_an_exited_scenario_does_not_restore_old_overrides(self):
+        m = self._market()()
+        outer, inner = dag.scenario(), dag.scenario()
+
+        with outer:
+            m.Spot.override(1.0)
+            with inner:
+                m.Spot.override(2.0)
+                assert m.Spot() == 2.0
+            assert m.Spot() == 1.0
+        assert m.Spot() == 100.0
+
+        with inner:
+            pass
+        assert m.Spot() == 100.0
+
+
+class TestOnGraphScenario:
+    """A cell that computes inside its own dag.scenario() must still hear
+    about later changes to everything its result depended on (review
+    2026-11-09, "found while fixing")."""
+
+    def setup_method(self):
+        dag.reset()
+
+    def test_change_reached_only_through_a_recomputed_cell(self):
+        calls = []
+
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def Vol(self):
+                return 2
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() * self.Vol()
+
+            @dag.computed
+            def Up(self):
+                calls.append(1)
+                with dag.scenario():
+                    self.Spot.override(101.0)
+                    return self.Price()
+
+        m = Model()
+        assert m.Up() == 202.0
+        assert m.Up() == 202.0
+        assert len(calls) == 1  # still cached
+
+        m.Vol.set(3)
+        assert m.Up() == 303.0
+        assert m.Price() == 300.0
+        assert m.Up() == 303.0
+        assert len(calls) == 2
+
+    def test_change_several_levels_below_the_scenario(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def RateQuote(self):
+                return 1.0
+
+            @dag.computed
+            def Rate(self):
+                return self.RateQuote() * 2
+
+            @dag.computed
+            def Forward(self):
+                return self.Spot() + self.Rate()
+
+            @dag.computed
+            def Price(self):
+                return self.Forward() * 10
+
+            @dag.computed
+            def Up(self):
+                with dag.scenario():
+                    self.Spot.override(101.0)
+                    return self.Price()
+
+            @dag.computed
+            def Report(self):
+                return self.Up() + 0.5
+
+        m = Model()
+        assert m.Report() == 1030.5
+
+        m.RateQuote.set(2.0)
+        assert m.Up() == 1050.0
+        assert m.Report() == 1050.5
+
+    def test_value_read_before_the_scenario_and_not_recomputed_in_it(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def Vol(self):
+                return 2
+
+            @dag.computed(dag.Input)
+            def Rate(self):
+                return 5
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() * self.Vol()
+
+            @dag.computed
+            def Forward(self):
+                return self.Spot() + self.Rate()
+
+            @dag.computed
+            def Spread(self):
+                base = self.Price()
+                with dag.scenario():
+                    self.Spot.override(101.0)
+                    forward = self.Forward()
+                return forward - base
+
+        m = Model()
+        assert m.Spread() == 106.0 - 200.0
+
+        m.Vol.set(3)
+        assert m.Spread() == 106.0 - 300.0
+
+        # Spot's own base value fed Price before the scenario replaced it,
+        # so a later override of Spot from outside must reach Spread too.
+        with dag.scenario():
+            m.Spot.override(50.0)
+            assert m.Spread() == 106.0 - 150.0
+        assert m.Spread() == 106.0 - 300.0
+
+    def test_dependency_taken_only_under_the_override(self):
+        """Price reads Vol only when Spot is high. Recomputing Price outside
+        the scenario drops its edge to Vol, but Up's result still depends
+        on it."""
+
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def Vol(self):
+                return 2
+
+            @dag.computed(dag.Input)
+            def OtherVol(self):
+                return 7
+
+            @dag.computed
+            def Price(self):
+                if self.Spot() > 100.5:
+                    return self.Spot() * self.Vol()
+                return self.Spot() * self.OtherVol()
+
+            @dag.computed
+            def Up(self):
+                with dag.scenario():
+                    self.Spot.override(101.0)
+                    return self.Price()
+
+        m = Model()
+        assert m.Up() == 202.0
+        assert m.Price() == 700.0  # recomputed along the other path
+
+        m.Vol.set(3)
+        assert m.Up() == 303.0
+
+    def test_overridden_cell_with_inputs_of_its_own(self):
+        class Model(dag.Model):
+            @dag.computed(dag.Input)
+            def Quote(self):
+                return 10.0
+
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return self.Quote()
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() ** 2
+
+            @dag.computed
+            def Delta(self):
+                spot = self.Spot()
+                base = self.Price()
+                with dag.scenario():
+                    self.Spot.override(spot + 1)
+                    up = self.Price()
+                return up - base
+
+        m = Model()
+        assert m.Delta() == 21.0
+
+        m.Quote.set(20.0)
+        assert m.Delta() == 41.0
+
+    def test_cells_the_scenario_did_not_consume_are_not_inherited(self):
+        """Overriding Spot invalidates every dependent of Spot, including
+        ones the scenario's owner never read. Their inputs must not become
+        the owner's dependencies."""
+        calls = []
+
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def Spot(self):
+                return 100.0
+
+            @dag.computed(dag.Input)
+            def Vol(self):
+                return 2
+
+            @dag.computed(dag.Input)
+            def Unrelated(self):
+                return 1
+
+            @dag.computed
+            def Price(self):
+                return self.Spot() * self.Vol()
+
+            @dag.computed
+            def OtherPrice(self):
+                return self.Spot() + self.Unrelated()
+
+            @dag.computed
+            def Up(self):
+                calls.append(1)
+                with dag.scenario():
+                    self.Spot.override(101.0)
+                    return self.Price()
+
+        m = Model()
+        assert m.OtherPrice() == 101.0
+        assert m.Up() == 202.0
+
+        m.Unrelated.set(5)
+        assert m.Up() == 202.0
+        assert len(calls) == 1
+        assert m.OtherPrice() == 105.0
+
+
+class TestGetOverridesNested:
+    """get_overrides() reports every override in effect, not only the
+    innermost scenario's (review 2026-11-09, correctness 7)."""
+
+    def setup_method(self):
+        dag.reset()
+
+    @staticmethod
+    def _model():
+        class Model(dag.Model):
+            @dag.computed(dag.Overridable)
+            def A(self):
+                return 1
+
+            @dag.computed(dag.Overridable)
+            def B(self):
+                return 2
+
+            @dag.computed
+            def Sum(self):
+                return self.A() + self.B()
+
+        return Model()
+
+    @staticmethod
+    def _as_dict(override_set):
+        return {o.method_name: o.value for o in override_set.overrides}
+
+    def test_outer_scenario_overrides_are_included(self):
+        m = self._model()
+        with dag.scenario():
+            m.A.override(10)
+            with dag.scenario():
+                m.B.override(20)
+                assert self._as_dict(dag.get_overrides()) == {'A': 10, 'B': 20}
+            assert self._as_dict(dag.get_overrides()) == {'A': 10}
+        assert self._as_dict(dag.get_overrides()) == {}
+
+    def test_node_overridden_in_both_scenarios_reports_the_visible_value(self):
+        m = self._model()
+        with dag.scenario():
+            m.A.override(10)
+            with dag.scenario():
+                m.A.override(11)
+                captured = dag.get_overrides()
+
+        assert len(captured.overrides) == 1
+        assert self._as_dict(captured) == {'A': 11}
+
+    def test_captured_nested_state_can_be_reapplied(self):
+        m = self._model()
+        with dag.scenario():
+            m.A.override(10)
+            with dag.scenario():
+                m.B.override(20)
+                expected = m.Sum()
+                captured = dag.get_overrides()
+
+        assert m.Sum() == 3
+        with dag.apply_overrides(captured):
+            assert m.Sum() == expected == 30
+        assert m.Sum() == 3

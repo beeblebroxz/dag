@@ -212,20 +212,24 @@ class BranchScenario(Scenario):
 
 def get_overrides() -> OverrideSet:
     """
-    Get the current overrides as an OverrideSet.
+    Get every override currently in effect as an OverrideSet.
+
+    Covers the whole stack of active scenarios, not only the innermost one,
+    so that applying the result elsewhere reproduces the state seen here.
+    Each node appears once, with the value currently visible for it.
 
     Useful for serializing scenario state for distributed computation.
     """
     dag = DagManager.get_instance()
-    ctx = dag.current_context
-
     override_set = OverrideSet()
 
-    if ctx is None:
-        return override_set
-
-    # A node overridden several times appears once with its current value.
-    unique_nodes = {node.key: node for node, _old_value in ctx._tweaks}
+    # Outermost scenario first. A node overridden several times, in one
+    # scenario or in nested ones, appears once with its current value.
+    unique_nodes = {
+        node.key: node
+        for ctx in dag.active_scenarios
+        for node, _old_value in ctx._tweaks
+    }
     for node in unique_nodes.values():
         obj = node.obj_ref()
         if obj is not None:
